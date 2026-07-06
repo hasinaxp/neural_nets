@@ -151,7 +151,7 @@ if __name__ == "__main__":
     ys = torch.stack([tokens[i + 1 : i + seq_len + 1] for i in range(4)])
 
     loss = None
-    steps = 1000
+    steps = 2000
     pbar = tqdm(range(steps))
     for _ in pbar:
         optimizer.zero_grad()
