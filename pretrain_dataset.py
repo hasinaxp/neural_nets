@@ -1,13 +1,14 @@
 import os
+import zipfile
 import pandas as pd
 
 RAW_DATASET_FOLDER = "dataset/raw"
+OMIT_LANGUAGE_CHECK_FILEPATTERNS = ["cosmopedia"]
+
 MINIMUM_CHUNK_SIZE = 1024
 MAXIMUM_CHUNK_SIZE = 3 * 1024
 MAX_CORPUS_SIZE = 200 * 1024 ** 2
 
-# Add patterns here to omit the language check and column reading for matching filepaths
-OMIT_LANGUAGE_CHECK_FILEPATTERNS = ["cosmopedia"]
 
 _pretrain_dataset_folders = sorted(os.listdir(RAW_DATASET_FOLDER))
 _pret_data_cached_file = None
@@ -74,8 +75,9 @@ def load_processed_chunks(
 
 
 def load_prcessed_wikipedia_chunks(chunk_size=MINIMUM_CHUNK_SIZE):
-    with open("dataset/wikipedia.txt", encoding="utf-8") as f:
-        text = f.read()
+    with zipfile.ZipFile("dataset/wikipedia.zip", "r") as zf:
+        with zf.open("wikipedia.txt") as f:
+            text = f.read().decode("utf-8")
 
     chunks, buf = [], ""
 
