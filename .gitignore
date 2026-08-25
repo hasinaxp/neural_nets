@@ -2,6 +2,6 @@ __pycache__/
 dataset/*
 artifacts/*
 !dataset/sample.txt
-!dataset/wikipedia.zip
+!dataset/wikipedia.txt.gz
 *.pt
 transformer_model.pt

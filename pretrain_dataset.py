@@ -1,5 +1,5 @@
+import gzip
 import os
-import zipfile
 import pandas as pd
 
 RAW_DATASET_FOLDER = "dataset/raw"
@@ -75,9 +75,18 @@ def load_processed_chunks(
 
 
 def load_prcessed_wikipedia_chunks(chunk_size=MINIMUM_CHUNK_SIZE):
-    with zipfile.ZipFile("dataset/wikipedia.zip", "r") as zf:
-        with zf.open("wikipedia.txt") as f:
-            text = f.read().decode("utf-8")
+    path = "dataset/wikipedia.txt.gz"
+    if not os.path.exists(path):
+        path = "dataset/wikipedia.zip"
+
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        import zipfile
+        with zipfile.ZipFile(path, "r") as zf:
+            with zf.open("wikipedia.txt") as f:
+                text = f.read().decode("utf-8")
 
     chunks, buf = [], ""
 
