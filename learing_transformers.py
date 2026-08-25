@@ -126,7 +126,7 @@ class Transformer(torch.nn.Module):
 
 if __name__ == "__main__":
     content = ""
-    with open("sample.txt", "r") as file:
+    with open("datasets/sample.txt", "r") as file:
         content = file.read()
 
     seq_len = DEFAULT_N_SEQ_LEN
