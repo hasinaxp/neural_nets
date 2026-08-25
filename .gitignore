@@ -2,3 +2,4 @@ __pycache__/
 dataset/*
 artifacts/*
 !dataset/sample.txt
+!dataset/wikipedia.txt
