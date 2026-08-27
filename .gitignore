@@ -6,4 +6,5 @@ artifacts/*
 transformer_model.pt
 !artifacts/tokenizer-20000.txt
 !artifacts/tokenizer-32768.txt
-logs/train*
+logs/train_2*
+logs/sft_2*

@@ -25,7 +25,7 @@ SEED = 1337
 VOCAB_SIZE = CONFIG.get("vocab_size", 20000)
 EMBEDDING_DIM = CONFIG.get("embedding_dim", 640)
 NUM_LAYERS = CONFIG.get("n_layers", 20)
-NUM_HEADS = CONFIG.get("n_heads", 10)
+NUM_HEADS = CONFIG.get("n_heads", 16)
 SEQ_LEN = CONFIG.get("seq_len", 1024)
 
 # Optimization
@@ -58,7 +58,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ARTIFACTS_DIR = "artifacts"
 LOG_DIR = "logs"
 TOKENIZER_FILE = f"{ARTIFACTS_DIR}/tokenizer-{VOCAB_SIZE}.txt"
-PRETRAINED_MODEL_FILE = f"{ARTIFACTS_DIR}/pretrain_model.pt"
+PRETRAINED_MODEL_FILE = f"{ARTIFACTS_DIR}/pretrain_checkpoint_latest.pt"
 TRAINED_MODEL_FILE = f"{ARTIFACTS_DIR}/sft_model.pt"
 CHECKPOINT_FILE = f"{ARTIFACTS_DIR}/sft_checkpoint_latest.pt"
 
