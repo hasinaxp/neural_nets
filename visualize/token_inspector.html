@@ -339,7 +339,7 @@ function displayText(str){
 
 function rankColor(rank, total){
   const t = total > 1 ? rank / (total - 1) : 0;
-  const rust = [138, 51, 36], gold = [232, 196, 104];
+  const rust = [0, 40, 176], gold = [0, 196, 254];
   const rgb = rust.map((c,i) => Math.round(c + (gold[i]-c)*t));
   return `rgb(${rgb.join(',')})`;
 }

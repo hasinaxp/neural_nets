@@ -1,6 +1,9 @@
 import gzip
+import math
 import os
 import pandas as pd
+import pyarrow.parquet as pq
+from torch.utils.data import Dataset
 
 RAW_DATASET_FOLDER = "dataset/raw"
 OMIT_LANGUAGE_CHECK_FILEPATTERNS = ["cosmopedia"]
@@ -30,26 +33,26 @@ def load_processed_chunks(
 
     for filepath in files:
         omit_language_check = any(pattern in filepath for pattern in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
-        
-        if _pret_data_cached_file == filepath: 
+
+        if _pret_data_cached_file == filepath:
             df = _pret_data_cached_df
         else:
             cols_to_read = ["text"] if omit_language_check else ["text", "language"]
             df = pd.read_parquet(filepath, columns=cols_to_read)
             _pret_data_cached_file, _pret_data_cached_df = filepath, df
 
-        if start >= (df_len := len(df)): 
+        if start >= (df_len := len(df)):
             start -= df_len
             end -= df_len
             continue
 
         rows = df.iloc[start:end]
-        
+
         if omit_language_check:
             texts = rows["text"].to_numpy()
         else:
             texts = rows.loc[rows["language"] == "en", "text"].to_numpy()
-            
+
         chunks = []
 
         for text in texts:
@@ -64,10 +67,10 @@ def load_processed_chunks(
                     split_at = text.rfind(".\n", 0, max_chunk_size + 1)
                     if split_at > 0: split_at += 1
                 if split_at <= 0: split_at = max_chunk_size
-                
+
                 left, text = text[:split_at].strip(), text[split_at:].strip()
                 if len(left) > min_chunk_size: chunks.append(left)
-                
+
             if len(text) > min_chunk_size: chunks.append(text)
 
         return chunks
@@ -117,6 +120,50 @@ def load_prcessed_wikipedia_chunks(chunk_size=MINIMUM_CHUNK_SIZE):
     return chunks
 
 
+class PretrainTextDataset(Dataset):
+    """Combines the parquet-backed pretrain corpus and the wikipedia corpus,
+    yielding fixed-size batches of raw text chunks."""
+
+    def __init__(self, batch_size=10, min_chunk_size=MINIMUM_CHUNK_SIZE,
+                 max_chunk_size=MAXIMUM_CHUNK_SIZE, dataset_folder=None,
+                 include_wikipedia=True, wikipedia_chunk_size=MINIMUM_CHUNK_SIZE):
+        self.batch_size = batch_size
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.dataset_folder = dataset_folder
+
+        files = _all_files if dataset_folder is None else sorted(
+            os.path.join(RAW_DATASET_FOLDER, dataset_folder, f)
+            for f in os.listdir(os.path.join(RAW_DATASET_FOLDER, dataset_folder))
+            if f.endswith(".parquet")
+        )
+        self._num_pretrain_rows = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+        self._num_pretrain_batches = math.ceil(self._num_pretrain_rows / batch_size)
+
+        self.wiki_chunks = load_prcessed_wikipedia_chunks(wikipedia_chunk_size) if include_wikipedia else []
+        self._num_wiki_batches = math.ceil(len(self.wiki_chunks) / batch_size) if self.wiki_chunks else 0
+
+    def __len__(self):
+        return self._num_pretrain_batches + self._num_wiki_batches
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+
+        if idx < self._num_pretrain_batches:
+            return load_processed_chunks(
+                idx, n=self.batch_size,
+                min_chunk_size=self.min_chunk_size,
+                max_chunk_size=self.max_chunk_size,
+                dataset_folder=self.dataset_folder,
+            )
+
+        wiki_idx = idx - self._num_pretrain_batches
+        start = wiki_idx * self.batch_size
+        return self.wiki_chunks[start:start + self.batch_size]
+
 
 if __name__ == "__main__":
     for c in load_processed_chunks(0, 2): print(c, "\n")
@@ -125,3 +172,7 @@ if __name__ == "__main__":
 
     wiki_chunks = load_prcessed_wikipedia_chunks()
     print(len(wiki_chunks))
+
+    ds = PretrainTextDataset(batch_size=8)
+    print(len(ds), "batches")
+    print(ds[0][0])

@@ -7,7 +7,9 @@ _PATTERN = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\
 
 
 class Tokenizer:
-    SPECIAL_TOKENS = ['<|BOS|>', '<|EOS|>', '<|PAD|>', '<|UNK|>', '<|USER|>', '<|ASSISTANT|>']
+    SPECIAL_TOKENS = [
+        '<|BOS|>', '<|EOS|>', '<|PAD|>', '<|UNK|>', '<|USER|>', '<|ASSISTANT|>'
+    ]
 
     def __init__(self, vocab_size=1000):
         self.vocab_size = vocab_size
