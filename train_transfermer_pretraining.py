@@ -156,21 +156,21 @@ epoch_avg_losses, epoch_avg_ppls = [], []
 
 
 def save_plots():
-    fig, ax = plt.subplots()
-    ax.plot(step_losses)
-    ax.set_xlabel("optimizer step")
-    ax.set_ylabel("loss")
-    ax.set_title("Training loss")
-    fig.savefig(os.path.join(LOG_DIR, "loss_curve.png"))
-    plt.close(fig)
+    # Single figure with two subplots (loss and perplexity) sharing x-axis
+    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
+    if step_losses:
+        ax1.plot(step_losses, label="loss")
+    ax1.set_ylabel("loss")
+    ax1.set_title("Training loss & perplexity")
 
-    fig, ax = plt.subplots()
-    ax.plot(step_ppls)
-    ax.set_xlabel("optimizer step")
-    ax.set_ylabel("perplexity")
-    ax.set_yscale("log")
-    ax.set_title("Training perplexity")
-    fig.savefig(os.path.join(LOG_DIR, "perplexity_curve.png"))
+    if step_ppls:
+        ax2.plot(step_ppls, label="perplexity")
+    ax2.set_xlabel("optimizer step")
+    ax2.set_ylabel("perplexity")
+    ax2.set_yscale("log")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(LOG_DIR, "loss_and_perplexity.png"))
     plt.close(fig)
 
     if epoch_avg_losses:
@@ -207,7 +207,13 @@ for epoch in range(NUM_EPOCHS):
     accum_steps = 0
 
     batch_iter = iter_training_batches(dataset, tokenizer, SEQ_LEN, BATCH_SIZE)
-    pbar = tqdm(batch_iter, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", unit="batch")
+    # Estimate total optimizer steps for the epoch (heuristic)
+    avg_chunk = (dataset.min_chunk_size + dataset.max_chunk_size) / 2 if hasattr(dataset, 'min_chunk_size') else 1500
+    estimated_steps = max(1, int(len(dataset) * (avg_chunk / SEQ_LEN)))
+    pbar = tqdm(batch_iter, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", unit="batch", total=estimated_steps)
+
+    epoch_step_start = time.time()
+    epoch_optim_steps = 0
 
     for xs, ys in pbar:
         xs, ys = xs.to(DEVICE), ys.to(DEVICE)
@@ -265,6 +271,19 @@ for epoch in range(NUM_EPOCHS):
                 logger.info(f"   step {global_step} | loss {step_loss:.4f} | ppl {step_ppl:.2f}")
                 save_plots()
                 save_metrics()
+
+            # ETA calculation and pbar update
+            epoch_optim_steps += 1
+            elapsed = time.time() - epoch_step_start
+            avg_time = elapsed / epoch_optim_steps if epoch_optim_steps else 0
+            remaining = max(0, estimated_steps - epoch_optim_steps)
+            eta = remaining * avg_time
+            pbar.set_postfix({
+                "loss": f"{current_avg_loss:.4f}",
+                "ppl": f"{current_ppl:.2f}",
+                "lr": f"{LEARNING_RATE:.2e}",
+                "eta": str(timedelta(seconds=int(eta)))
+            })
 
     pbar.close()
 
