@@ -17,14 +17,14 @@ TRAINED_MODEL_FILE = "artifacts/sample_model.pt"
 
 
 
-VOCAB_SIZE = 500  # Target; actual model vocab size is taken from the loaded tokenizer.
+VOCAB_SIZE = 20000  # Target; actual model vocab size is taken from the loaded tokenizer.
 SEQ_LEN = 128
-EMBEDDING_DIM = 64
+EMBEDDING_DIM = 128
 NUM_HEADS = 8
 NUM_LAYERS = 8
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 25
+NUM_EPOCHS = 30
 GRAD_ACCUM_STEPS = 2
 GRAD_CLIP_NORM = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,12 +39,14 @@ tokenizer.load(TOKENIZER_FILE)
 
 
 actual_vocab_size = max(tokenizer.vocab) + 1 if tokenizer.vocab else tokenizer.vocab_size
+print("vocab size", actual_vocab_size)
 
 MODEL_VOCAB_SIZE = actual_vocab_size
 
 print("\n[2] Preparing training data...")
 with open(SAMPLE_FILE, "r", encoding="utf-8") as f:
     text = f.read()
+    text = text * 4
 
 tokens = tokenizer.encode(text)
 print(f"   Total tokens (including boundaries): {len(tokens)}")
@@ -76,6 +78,8 @@ base_model = Transformer(
     n_dim=EMBEDDING_DIM,
     n_seq=SEQ_LEN,
 ).to(DEVICE)
+
+torch.compile(base_model)
 
 param_count = base_model.get_param_count()
 print(f"   Model parameters: {param_count:,}")
@@ -150,6 +154,7 @@ for epoch in range(NUM_EPOCHS):
     epoch_time = time.time() - epoch_start_time
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    time.sleep(0.7)
 
     print(f"   Epoch {epoch + 1}/{NUM_EPOCHS} | Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f} | "
           f"Batches: {num_batches} | Time: {timedelta(seconds=int(epoch_time))}")
