@@ -1,286 +1,215 @@
-import os
-from collections import Counter
+import heapq
+from collections import Counter, defaultdict
+import regex as re
 from tqdm import tqdm
+
+_PATTERN = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 
 class Tokenizer:
-    """
-    - Ascii-only
-    - Sentence-level sub-word BPE tokenizer: merges are learned, and applied at
-      encode time, independently per sentence — a merge never bridges across a
-      sentence-terminal ('.', '!', '?') boundary.
-    - Special tokens: <|BOS|>, <|EOS|>, <|PAD|>, <|UNK|>, <|USER|>, <|ASSISTANT|>
-    """
-    DEFAULT_VOCAB = {' ': 0, '\n': 1, '\t': 2}
-
-    # Separator used in the on-disk vocab format. Doesn't need escaping itself as
-    # long as escaped tokens never happen to contain this exact literal substring,
-    # which is astronomically unlikely for ASCII/BPE-merged tokens.
-    _SEP = "|_@:/_|"
+    SPECIAL_TOKENS = ['<|BOS|>', '<|EOS|>', '<|PAD|>', '<|UNK|>', '<|USER|>', '<|ASSISTANT|>']
 
     def __init__(self, vocab_size=1000):
         self.vocab_size = vocab_size
-        self.vocab = self.DEFAULT_VOCAB.copy()
-        self.id_to_token = {v: k for k, v in self.vocab.items()}
-        self.merges = []          # list of (id1, id2, new_id)
-        self.current_vocab_size = len(self.vocab)
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        self.merges = []
+        self.merge_ranks = {}
+        self.special_tokens = {t: 256 + i for i, t in enumerate(self.SPECIAL_TOKENS)}
+        self.merge_id_offset = 256 + len(self.SPECIAL_TOKENS)
+        self._cache = {}
+        self._register_special_tokens()
 
-    # ------------------------------------------------------------------
-    # ASCII filtering
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _ascii_only(text: str) -> str:
-        """Drop any non-ASCII character entirely (not mapped to <|UNK|>, just removed)."""
-        return ''.join(c for c in text if ord(c) < 128)
+    def _register_special_tokens(self):
+        self.vocab.update({
+            token_id: token.encode("utf-8")
+            for token, token_id in self.special_tokens.items()
+        })
+        self.vocab_size = max(self.vocab_size, max(self.vocab) + 1)
 
-    # ------------------------------------------------------------------
-    # Sentence segmentation
-    # ------------------------------------------------------------------
-    def _split_segments(self, text: str) -> list[str]:
-        """
-        Split text into segments right after each sentence-terminal character
-        ('.', '!', '?'), WITHOUT reformatting whitespace. Concatenating the
-        returned segments reproduces `text` exactly — this is what lets
-        `encode`/`decode` stay lossless while still respecting sentence
-        boundaries the same way `train_from_file` does.
-        """
-        segments = []
-        start = 0
-        for i, ch in enumerate(text):
-            if ch in ('.', '!', '?'):
-                segments.append(text[start:i + 1])
-                start = i + 1
-        if start < len(text):
-            segments.append(text[start:])
-        return segments
-
-    def _apply_merges(self, token_ids: list[int]) -> list[int]:
-        """Apply learned merges (in order) to a single token-id sequence."""
-        for id1, id2, new_id in self.merges:
-            new_tokens = []
-            i = 0
-            while i < len(token_ids):
-                if i + 1 < len(token_ids) and token_ids[i] == id1 and token_ids[i + 1] == id2:
-                    new_tokens.append(new_id)
+    def _merge_ids(self, ids):
+        if len(ids) < 2:
+            return ids
+        while True:
+            best_pair, best_rank = None, None
+            for i in range(len(ids) - 1):
+                r = self.merge_ranks.get((ids[i], ids[i + 1]))
+                if r is not None and (best_rank is None or r < best_rank):
+                    best_pair, best_rank = (ids[i], ids[i + 1]), r
+            if best_pair is None:
+                return ids
+            id1, id2 = best_pair
+            new_id = self.merge_id_offset + best_rank
+            new_ids, i = [], 0
+            while i < len(ids):
+                if i + 1 < len(ids) and ids[i] == id1 and ids[i + 1] == id2:
+                    new_ids.append(new_id)
                     i += 2
                 else:
-                    new_tokens.append(token_ids[i])
+                    new_ids.append(ids[i])
                     i += 1
-            token_ids = new_tokens
-        return token_ids
+            ids = new_ids
 
-    def encode(self, text: str) -> list[int]:
-        """
-        Encode text to token IDs using learned BPE merges. Text is first split
-        into sentence-level segments (matching how merges were trained), and
-        merges are applied independently within each segment so no merge can
-        bridge across a sentence boundary.
-        """
-        unk_id = self.vocab.get('<|UNK|>')
-        if unk_id is None:
-            raise ValueError("<|UNK|> token not found in vocabulary")
+    def train_from_text(self, text):
+        for t in self.SPECIAL_TOKENS:
+            text = text.replace(t, ' ')
 
-        text = self._ascii_only(text)
+        word_freq = Counter()
+        for m in _PATTERN.finditer(text):
+            word_freq[m.group(0).encode('utf-8')] += 1
 
-        all_tokens = []
-        for segment in self._split_segments(text):
-            seg_tokens = [self.vocab.get(char, unk_id) for char in segment]
-            all_tokens.extend(self._apply_merges(seg_tokens))
-        return all_tokens
-
-    def decode(self, tokens: list[int]) -> str:
-        """Decode token IDs back to text, using <|UNK|> for unknown IDs."""
-        unk_str = '<|UNK|>'
-        return ''.join(self.id_to_token.get(t, unk_str) for t in tokens)
-
-    def train_from_file(self, file_path: str):
-        """Train BPE from an ASCII text file using sentence-level in-place merges."""
-        # Read file and keep only ASCII
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-        text = self._ascii_only(text)
-
-        # Build base vocabulary: unique characters + special tokens
-        self.vocab = self.DEFAULT_VOCAB.copy()
-        for char in set(text):
-            if char not in self.vocab:
-                self.vocab[char] = len(self.vocab)
-
-        special_tokens = [
-            '<|BOS|>', '<|EOS|>', '<|PAD|>',
-            '<|UNK|>', '<|USER|>', '<|ASSISTANT|>'
-        ]
-        for token in special_tokens:
-            self.vocab[token] = len(self.vocab)
-
-        self.id_to_token = {v: k for k, v in self.vocab.items()}
+        self.vocab = {i: bytes([i]) for i in range(256)}
         self.merges = []
+        self.merge_ranks = {}
+        self._cache = {}
+        self._register_special_tokens()
 
-        # Tokenize each sentence into a list of character token IDs
-        sentences = self.get_sentences(text)
-        sentence_tokens = []
-        for s in sentences:
-            tokens = [self.vocab[char] for char in s]   # all chars are in vocab
-            if tokens:
-                sentence_tokens.append(tokens)
+        words, freqs = [], []
+        for wbytes, f in word_freq.items():
+            seq = list(wbytes)
+            if len(seq) >= 2:
+                words.append(seq)
+                freqs.append(f)
 
-        # BPE training loop
-        initial_vocab_size = len(self.vocab)
-        pbar = tqdm(total=self.vocab_size - initial_vocab_size,
-                    desc="BPE training", unit="merge")
+        pair_counts = {}
+        pair_positions = defaultdict(set)
+        for w, seq in enumerate(words):
+            f = freqs[w]
+            for i in range(len(seq) - 1):
+                p = (seq[i], seq[i + 1])
+                pair_counts[p] = pair_counts.get(p, 0) + f
+                pair_positions[p].add(w)
 
-        while len(self.vocab) < self.vocab_size:
-            # Count adjacent pairs across all sentences (never across sentences)
-            pair_counts = Counter()
-            for seq in sentence_tokens:
-                for i in range(len(seq) - 1):
-                    pair_counts[(seq[i], seq[i + 1])] += 1
+        heap = [(-c, p[0], p[1]) for p, c in pair_counts.items()]
+        heapq.heapify(heap)
 
-            if not pair_counts:
+        target = self.vocab_size - self.merge_id_offset
+        pbar = tqdm(total=max(target, 0), desc="BPE training", unit="merge")
+
+        while len(self.merges) < target:
+            best_pair, best_freq = None, 0
+            while heap:
+                neg_c, a, b = heapq.heappop(heap)
+                p = (a, b)
+                cur = pair_counts.get(p, 0)
+                if cur != -neg_c or cur <= 0:
+                    continue
+                best_pair, best_freq = p, cur
+                break
+            if best_pair is None or best_freq < 2:
                 break
 
-            best_pair_ids, freq = pair_counts.most_common(1)[0]
-            if freq < 2:   # no pair appears often enough to merge
-                break
+            id1, id2 = best_pair
+            new_id = self.merge_id_offset + len(self.merges)
+            self.vocab[new_id] = self.vocab[id1] + self.vocab[id2]
+            self.merges.append((id1, id2))
+            self.merge_ranks[(id1, id2)] = len(self.merges) - 1
 
-            id1, id2 = best_pair_ids
-            t1 = self.id_to_token[id1]
-            t2 = self.id_to_token[id2]
-            merged_token = t1 + t2
-            new_id = len(self.vocab)
-
-            # Update vocabulary and merge history (as integer triple)
-            self.vocab[merged_token] = new_id
-            self.id_to_token[new_id] = merged_token
-            self.merges.append((id1, id2, new_id))
-
-            # Replace the pair in every sentence (in-place)
-            for idx, seq in enumerate(sentence_tokens):
-                new_seq = []
-                i = 0
+            for w in list(pair_positions.get(best_pair, ())):
+                seq, f = words[w], freqs[w]
+                new_seq, i = [], 0
                 while i < len(seq):
                     if i + 1 < len(seq) and seq[i] == id1 and seq[i + 1] == id2:
+                        left = new_seq[-1] if new_seq else None
+                        right = seq[i + 2] if i + 2 < len(seq) else None
+                        if left is not None:
+                            lp = (left, id1)
+                            pair_counts[lp] = pair_counts.get(lp, 0) - f
+                            heapq.heappush(heap, (-pair_counts[lp], lp[0], lp[1]))
+                        if right is not None:
+                            rp = (id2, right)
+                            pair_counts[rp] = pair_counts.get(rp, 0) - f
+                            heapq.heappush(heap, (-pair_counts[rp], rp[0], rp[1]))
                         new_seq.append(new_id)
+                        if left is not None:
+                            np1 = (left, new_id)
+                            pair_counts[np1] = pair_counts.get(np1, 0) + f
+                            pair_positions[np1].add(w)
+                            heapq.heappush(heap, (-pair_counts[np1], np1[0], np1[1]))
+                        if right is not None:
+                            np2 = (new_id, right)
+                            pair_counts[np2] = pair_counts.get(np2, 0) + f
+                            pair_positions[np2].add(w)
+                            heapq.heappush(heap, (-pair_counts[np2], np2[0], np2[1]))
                         i += 2
                     else:
                         new_seq.append(seq[i])
                         i += 1
-                sentence_tokens[idx] = new_seq
+                words[w] = new_seq
 
+            pair_counts[best_pair] = 0
+            pair_positions.pop(best_pair, None)
             pbar.update(1)
-
         pbar.close()
-        self.current_vocab_size = len(self.vocab)
 
-    # ------------------------------------------------------------------
-    # Serialization. Tokens are escaped so that '\\', '|', '@', '\n', and '\r'
-    # can never corrupt the line-based file format on save/load.
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _escape_token(token: str) -> str:
-        # Order matters: escape backslashes first so the backslashes introduced
-        # for \n/\r below aren't themselves re-escaped.
-        token = token.replace("\\", "\\\\")
-        token = token.replace("|", "||").replace("@", "@@")
-        token = token.replace("\n", "\\n").replace("\r", "\\r")
-        return token
+    def train_from_file(self, file_path):
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+        self.train_from_text(text)
 
-    @staticmethod
-    def _unescape_token(token: str) -> str:
-        # Reverse order of _escape_token.
-        token = token.replace("\\n", "\n").replace("\\r", "\r")
-        token = token.replace("||", "|").replace("@@", "@")
-        token = token.replace("\\\\", "\\")
-        return token
+    def encode(self, text):
+        atomic = self.special_tokens
+        pattern = "(" + "|".join(re.escape(t) for t in sorted(atomic, key=len, reverse=True)) + ")"
+        ids = []
+        for chunk in re.split(pattern, text):
+            if not chunk:
+                continue
+            if chunk in atomic:
+                ids.append(atomic[chunk])
+                continue
+            for m in _PATTERN.finditer(chunk):
+                wbytes = m.group(0).encode('utf-8')
+                cached = self._cache.get(wbytes)
+                if cached is None:
+                    cached = self._merge_ids(list(wbytes))
+                    self._cache[wbytes] = cached
+                ids.extend(cached)
+        return ids
 
-    def save(self, file_path: str):
-        """Save vocabulary and merge rules to a file (integer triples for merges)."""
-        with open(file_path, "w", encoding="utf-8") as f:
-            for token, idx in self.vocab.items():
-                escaped_token = self._escape_token(token)
-                f.write(f"{escaped_token}{self._SEP}{idx}\n")
-            f.write("MERGES\n")
-            for id1, id2, new_id in self.merges:
-                f.write(f"{id1} {id2} {new_id}\n")
+    def decode(self, tokens):
+        id_to_special = {v: k for k, v in self.special_tokens.items()}
+        parts, buf = [], bytearray()
+        for i in tokens:
+            if i in id_to_special:
+                if buf:
+                    parts.append(bytes(buf).decode('utf-8', errors='replace'))
+                    buf = bytearray()
+                parts.append(id_to_special[i])
+            else:
+                b = self.vocab.get(i)
+                if b is not None:
+                    buf.extend(b)
+        if buf:
+            parts.append(bytes(buf).decode('utf-8', errors='replace'))
+        return "".join(parts)
 
-    def load(self, file_path: str):
-        """Load vocabulary and merge rules from a saved file."""
-        self.vocab = self.DEFAULT_VOCAB.copy()
+    def save(self, file_path):
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(f"{self.vocab_size}\n")
+            for id1, id2 in self.merges:
+                f.write(f"{id1} {id2}\n")
+
+    def load(self, file_path):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        self.vocab_size = int(lines[0])
+        self.vocab = {i: bytes([i]) for i in range(256)}
         self.merges = []
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        # Read vocab until "MERGES" marker
-        merge_marker = "MERGES\n"
-        idx = 0
-        while idx < len(lines) and lines[idx] != merge_marker:
-            line = lines[idx].rstrip("\n")
+        self.merge_ranks = {}
+        for idx, line in enumerate(lines[1:]):
             if not line:
-                idx += 1
                 continue
-            parts = line.split(self._SEP)
-            if len(parts) != 2:
-                idx += 1
-                continue
-            token, idx_str = parts
-            token = self._unescape_token(token)
-            try:
-                self.vocab[token] = int(idx_str)
-            except ValueError:
-                pass
-            idx += 1
-
-        if idx < len(lines) and lines[idx] == merge_marker:
-            idx += 1
-
-        # Read merges as integer triples
-        while idx < len(lines):
-            line = lines[idx].strip()
-            if not line:
-                idx += 1
-                continue
-            parts = line.split()
-            if len(parts) != 3:
-                idx += 1
-                continue
-            try:
-                id1, id2, new_id = int(parts[0]), int(parts[1]), int(parts[2])
-                self.merges.append((id1, id2, new_id))
-            except ValueError:
-                pass
-            idx += 1
-
-        self.id_to_token = {v: k for k, v in self.vocab.items()}
-        self.current_vocab_size = len(self.vocab)
-
-    def get_sentences(self, text: str) -> list[str]:
-        """Split ASCII text into sentences (training-corpus cleanup: collapses
-        hard-wrapped lines within a paragraph into single lines). Used only for
-        training — `encode` uses the lossless `_split_segments` instead so that
-        encode/decode round-trips exactly."""
-        text = text.strip()
-        text = self._ascii_only(text)
-        blocks = text.split('\n\n')
-        for i in range(len(blocks)):
-            lines = [line.strip() for line in blocks[i].splitlines() if line.rstrip()]
-            blocks[i] = ' '.join(lines)
-        text = '\n\n'.join(blocks)
-        sentences = []
-        current = []
-        for char in text:
-            current.append(char)
-            if char in ('.', '!', '?'):
-                sentences.append(''.join(current).strip())
-                current = []
-        if current:
-            sentences.append(''.join(current).strip())
-        return sentences
+            a, b = map(int, line.split())
+            new_id = self.merge_id_offset + idx
+            self.vocab[new_id] = self.vocab[a] + self.vocab[b]
+            self.merges.append((a, b))
+            self.merge_ranks[(a, b)] = idx
+        self._cache = {}
+        self._register_special_tokens()
 
 
-# test
 if __name__ == "__main__":
-    tokenizer = Tokenizer(vocab_size=1000)        # small value for quick testing
-    tokenizer.train_from_file("datasets/sample.txt")      # ensure sample.txt exists
+    tokenizer = Tokenizer(vocab_size=1000)
+    tokenizer.train_from_file("dataset/sample.txt")
 
     text = """
 Away, you fool! it more becomes a man

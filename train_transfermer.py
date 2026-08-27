@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from tokenizer import Tokenizer
-from basic_transformer import Transformer
+from simple_transformer import Transformer
 from tqdm import tqdm
 import time
 from datetime import timedelta
@@ -24,7 +24,7 @@ NUM_HEADS = 8
 NUM_LAYERS = 8
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 130
+NUM_EPOCHS = 25
 GRAD_ACCUM_STEPS = 2
 GRAD_CLIP_NORM = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -33,12 +33,12 @@ print(f"Using device: {DEVICE}")
 
 print("\n[1] Setting up sub-sentence tokenizer...")
 tokenizer = Tokenizer(vocab_size=VOCAB_SIZE)
-tokenizer.train_from_file(SAMPLE_FILE)
-tokenizer.save(TOKENIZER_FILE)
+# tokenizer.train_from_file(SAMPLE_FILE)
+# tokenizer.save(TOKENIZER_FILE)
 tokenizer.load(TOKENIZER_FILE)
 
 
-actual_vocab_size = len(tokenizer.vocab)
+actual_vocab_size = max(tokenizer.vocab) + 1 if tokenizer.vocab else tokenizer.vocab_size
 
 MODEL_VOCAB_SIZE = actual_vocab_size
 
@@ -81,13 +81,10 @@ param_count = base_model.get_param_count()
 print(f"   Model parameters: {param_count:,}")
 
 
-print("   Compiling model for training...")
-try:
-    train_model = torch.compile(base_model, mode="reduce-overhead")
-    print("   Model compiled successfully")
-except Exception as e:
-    print(f"   Model compilation failed: {e}")
-    train_model = base_model
+print("   Using eager execution mode for training...")
+# torch.compile is unstable on some Windows CUDA builds for this custom
+# transformer and causes device-side asserts during the RoPE setup.
+train_model = base_model
 
 optimizer = torch.optim.Adam(base_model.parameters(), lr=LEARNING_RATE)
 
@@ -164,7 +161,7 @@ print(f"   Model saved to {TRAINED_MODEL_FILE}")
 print("\n[5] Generating predictions...")
 base_model.eval()
 
-seed_token = torch.randint(0, MODEL_VOCAB_SIZE, (1, 1)).to(DEVICE)
+seed_token = torch.tensor([[tokenizer.special_tokens["<|BOS|>"]]], dtype=torch.long, device=DEVICE)
 with torch.no_grad():
     generated = base_model.generate(seed_token, max_count=100)
 

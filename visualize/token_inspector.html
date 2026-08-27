@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BPE Token Inspector</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root{
+    --bg: #17140f;
+    --panel: #201b14;
+    --panel-2: #262019;
+    --line: #3a3226;
+    --cream: #ede6d8;
+    --muted: #a89b83;
+    --rust: #8a3324;
+    --gold: #e8c468;
+    --raw: #6b6252;
+    --special: #5c8ea6;
+    --focus: #e8c468;
+  }
+
+  *{ box-sizing: border-box; }
+  html{ scroll-behavior: smooth; }
+
+  body{
+    margin:0;
+    background: radial-gradient(ellipse at top left, #201a12 0%, var(--bg) 55%);
+    color: var(--cream);
+    font-family: 'Inter', sans-serif;
+    min-height: 100vh;
+    padding: 40px 24px 80px;
+  }
+
+  .wrap{ max-width: 980px; margin: 0 auto; }
+
+  header{ margin-bottom: 32px; }
+  .eyebrow{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin: 0 0 10px;
+  }
+  h1{
+    font-family:'IBM Plex Mono', monospace;
+    font-weight: 700;
+    font-size: clamp(28px, 4vw, 40px);
+    margin: 0 0 10px;
+    letter-spacing: -0.01em;
+  }
+  header p{
+    color: var(--muted);
+    max-width: 640px;
+    line-height: 1.55;
+    margin: 0;
+    font-size: 15px;
+  }
+
+  .panel{
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 22px;
+    margin-bottom: 20px;
+  }
+
+  .panel h2{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+
+  .file-row{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+
+  .file-btn{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 13px;
+    font-weight: 600;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--cream);
+    padding: 10px 16px;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .file-btn:hover{ border-color: var(--gold); }
+  .file-btn:focus-visible, textarea:focus-visible, button:focus-visible{
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+  input[type=file]{ display:none; }
+
+  #loadStatus{ font-family:'IBM Plex Mono', monospace; font-size: 13px; color: var(--muted); }
+  #loadStatus.ok{ color: var(--gold); }
+  #loadStatus.err{ color: #c96a52; }
+
+  textarea{
+    width: 100%;
+    min-height: 120px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--cream);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    border-radius: 7px;
+    padding: 14px;
+    resize: vertical;
+  }
+  textarea::placeholder{ color: #6b6252; }
+
+  .stats{
+    display:flex; gap: 22px; flex-wrap: wrap;
+    margin-top: 16px;
+    font-family:'IBM Plex Mono', monospace;
+  }
+  .stat{ min-width: 90px; }
+  .stat .num{ font-size: 22px; font-weight: 700; color: var(--gold); }
+  .stat .label{ font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-top: 2px; }
+
+  #tokenStream{
+    display:flex; flex-wrap: wrap; gap: 6px;
+    line-height: 1.8;
+    min-height: 60px;
+  }
+  #tokenStream .empty{
+    font-family:'IBM Plex Mono', monospace;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .chip{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 13.5px;
+    padding: 3px 8px;
+    border-radius: 5px;
+    border: 1.5px solid var(--raw);
+    background: rgba(255,255,255,0.03);
+    white-space: pre;
+    cursor: default;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    animation: rise .22s ease both;
+  }
+  @media (prefers-reduced-motion: reduce){ .chip{ animation: none; } }
+  @keyframes rise{ from{ opacity:0; transform: translateY(3px);} to{ opacity:1; transform: translateY(0);} }
+
+  .chip .dot{
+    width: 7px; height: 7px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .chip.special{
+    border-color: var(--special);
+    background: rgba(92,142,166,0.14);
+    text-transform: uppercase;
+    font-weight: 600;
+    font-size: 11.5px;
+  }
+  .chip.raw{ border-style: dashed; }
+
+  .legend{
+    display:flex; align-items:center; gap: 22px; flex-wrap: wrap;
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 18px;
+    padding-top: 16px;
+    border-top: 1px dashed var(--line);
+  }
+  .legend .swatch-row{ display:flex; align-items:center; gap:8px; }
+  .gradient-bar{
+    width: 90px; height: 8px; border-radius: 4px;
+    background: linear-gradient(90deg, var(--rust), var(--gold));
+  }
+  .dot-solo{ width: 10px; height: 10px; border-radius: 50%; display:inline-block; }
+
+  footer{
+    margin-top: 30px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #5c5546;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Byte-pair encoding // visual debugger</p>
+    <h1>Token Inspector</h1>
+    <p>Load the merges file your tokenizer saved, paste in some text, and see exactly where it splits — with color showing how early (rust) or late (gold) each merge was learned. Gray dashed chips are raw, unmerged bytes.</p>
+  </header>
+
+  <section class="panel">
+    <h2>01 — Load merges</h2>
+    <div class="file-row">
+      <label class="file-btn" for="fileInput" tabindex="0">Choose tokenizer.txt</label>
+      <input id="fileInput" type="file" accept=".txt">
+      <span id="loadStatus">No file loaded yet.</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>02 — Text to tokenize</h2>
+    <textarea id="textInput" placeholder="Type or paste text here…">Away, you fool! it more becomes a man
+Than gilt his trophy: the breasts of Hecuba,
+When she did suckle Hector, look'd not lovelier</textarea>
+    <div class="stats">
+      <div class="stat"><div class="num" id="statChars">0</div><div class="label">Characters</div></div>
+      <div class="stat"><div class="num" id="statTokens">0</div><div class="label">Tokens</div></div>
+      <div class="stat"><div class="num" id="statRatio">0</div><div class="label">Chars / Token</div></div>
+      <div class="stat"><div class="num" id="statRaw">0</div><div class="label">Unmerged bytes</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>03 — Token stream</h2>
+    <div id="tokenStream"><span class="empty">Load a merges file to begin.</span></div>
+
+    <div class="legend">
+      <div class="swatch-row"><div class="gradient-bar"></div><span>merge rank: early → late</span></div>
+      <div class="swatch-row"><span class="dot-solo" style="background:var(--raw); border:1.5px dashed var(--raw)"></span><span>unmerged raw byte</span></div>
+      <div class="swatch-row"><span class="dot-solo" style="background:var(--special)"></span><span>special token</span></div>
+    </div>
+  </section>
+
+  <footer>· = space &nbsp;&nbsp; ↵ = newline &nbsp;&nbsp; → = tab &nbsp;&nbsp; hover a chip for details</footer>
+</div>
+
+<script>
+const SPECIAL_TOKENS = ['<|BOS|>', '<|EOS|>', '<|PAD|>', '<|UNK|>', '<|USER|>', '<|ASSISTANT|>'];
+const MERGE_ID_OFFSET = 256 + SPECIAL_TOKENS.length; // 262
+const WORD_PATTERN = /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+
+let state = null; // { vocabBytes: Map<id, Uint8Array>, mergeRanks: Map<"a,b", rank>, totalMerges, specialIds: Map<string,id> }
+
+function buildBaseVocab(){
+  const vocabBytes = new Map();
+  for(let i=0;i<256;i++) vocabBytes.set(i, new Uint8Array([i]));
+  const specialIds = new Map();
+  const enc = new TextEncoder();
+  SPECIAL_TOKENS.forEach((tok, i) => {
+    const id = 256 + i;
+    vocabBytes.set(id, enc.encode(tok));
+    specialIds.set(tok, id);
+  });
+  return { vocabBytes, specialIds };
+}
+
+function parseMergesFile(text){
+  const lines = text.split(/\r?\n/);
+  const declaredVocabSize = parseInt(lines[0], 10);
+  const { vocabBytes, specialIds } = buildBaseVocab();
+  const mergeRanks = new Map();
+  let rank = 0;
+  for(let i=1;i<lines.length;i++){
+    const line = lines[i].trim();
+    if(!line) continue;
+    const parts = line.split(/\s+/).map(Number);
+    if(parts.length !== 2 || parts.some(Number.isNaN)) continue;
+    const [a,b] = parts;
+    if(!vocabBytes.has(a) || !vocabBytes.has(b)) continue;
+    const newId = MERGE_ID_OFFSET + rank;
+    const merged = new Uint8Array(vocabBytes.get(a).length + vocabBytes.get(b).length);
+    merged.set(vocabBytes.get(a), 0);
+    merged.set(vocabBytes.get(b), vocabBytes.get(a).length);
+    vocabBytes.set(newId, merged);
+    mergeRanks.set(a + "," + b, rank);
+    rank++;
+  }
+  return { vocabBytes, mergeRanks, totalMerges: rank, specialIds, declaredVocabSize };
+}
+
+function bpeMerge(ids, mergeRanks){
+  ids = ids.slice();
+  while(true){
+    let bestPair = null, bestRank = Infinity;
+    for(let i=0;i<ids.length-1;i++){
+      const key = ids[i] + "," + ids[i+1];
+      const r = mergeRanks.get(key);
+      if(r !== undefined && r < bestRank){ bestRank = r; bestPair = [ids[i], ids[i+1]]; }
+    }
+    if(bestPair === null) break;
+    const newId = MERGE_ID_OFFSET + bestRank;
+    const newIds = [];
+    let i = 0;
+    while(i < ids.length){
+      if(i+1 < ids.length && ids[i] === bestPair[0] && ids[i+1] === bestPair[1]){
+        newIds.push(newId); i += 2;
+      } else { newIds.push(ids[i]); i += 1; }
+    }
+    ids = newIds;
+  }
+  return ids;
+}
+
+function encode(text, s){
+  const specials = Array.from(s.specialIds.keys());
+  const escaped = specials.sort((a,b)=>b.length-a.length).map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const splitRe = new RegExp("(" + escaped.join("|") + ")");
+  const chunks = escaped.length ? text.split(splitRe) : [text];
+  const enc = new TextEncoder();
+  const tokens = []; // {id, isSpecial}
+
+  for(const chunk of chunks){
+    if(!chunk) continue;
+    if(s.specialIds.has(chunk)){
+      tokens.push({ id: s.specialIds.get(chunk), isSpecial: true });
+      continue;
+    }
+    const matches = chunk.match(WORD_PATTERN) || [];
+    for(const word of matches){
+      const bytes = Array.from(enc.encode(word));
+      const merged = bpeMerge(bytes, s.mergeRanks);
+      for(const id of merged) tokens.push({ id, isSpecial: false });
+    }
+  }
+  return tokens;
+}
+
+function decodeBytes(vocabBytes, id){
+  const bytes = vocabBytes.get(id);
+  if(!bytes) return '';
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+}
+
+function displayText(str){
+  return str.replace(/ /g, '·').replace(/\t/g, '→').replace(/\n/g, '↵');
+}
+
+function rankColor(rank, total){
+  const t = total > 1 ? rank / (total - 1) : 0;
+  const rust = [138, 51, 36], gold = [232, 196, 104];
+  const rgb = rust.map((c,i) => Math.round(c + (gold[i]-c)*t));
+  return `rgb(${rgb.join(',')})`;
+}
+
+function render(){
+  const streamEl = document.getElementById('tokenStream');
+  const text = document.getElementById('textInput').value;
+
+  if(!state){
+    streamEl.innerHTML = '<span class="empty">Load a merges file to begin.</span>';
+    updateStats(text.length, 0, 0);
+    return;
+  }
+  if(!text){
+    streamEl.innerHTML = '<span class="empty">Type something above.</span>';
+    updateStats(0,0,0);
+    return;
+  }
+
+  const tokens = encode(text, state);
+  streamEl.innerHTML = '';
+  let rawCount = 0;
+
+  tokens.forEach(tok => {
+    const span = document.createElement('span');
+    span.className = 'chip';
+    const raw = decodeBytes(state.vocabBytes, tok.id);
+
+    if(tok.isSpecial){
+      span.classList.add('special');
+      span.textContent = raw;
+      span.title = `id ${tok.id} · special token`;
+    } else if(tok.id < 256){
+      span.classList.add('raw');
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = 'var(--raw)';
+      span.appendChild(dot);
+      span.appendChild(document.createTextNode(displayText(raw) || '·'));
+      span.title = `id ${tok.id} · raw byte, no merge learned`;
+      rawCount++;
+    } else {
+      const rank = tok.id - MERGE_ID_OFFSET;
+      const color = rankColor(rank, state.totalMerges);
+      span.style.borderColor = color;
+      span.style.background = color.replace('rgb', 'rgba').replace(')', ',0.14)');
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = color;
+      span.appendChild(dot);
+      span.appendChild(document.createTextNode(displayText(raw)));
+      span.title = `id ${tok.id} · merge rank ${rank} of ${state.totalMerges}`;
+    }
+    streamEl.appendChild(span);
+  });
+
+  updateStats(text.length, tokens.length, rawCount);
+}
+
+function updateStats(chars, tokenCount, rawCount){
+  document.getElementById('statChars').textContent = chars;
+  document.getElementById('statTokens').textContent = tokenCount;
+  document.getElementById('statRatio').textContent = tokenCount ? (chars/tokenCount).toFixed(2) : '0';
+  document.getElementById('statRaw').textContent = rawCount;
+}
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try{
+      state = parseMergesFile(reader.result);
+      const statusEl = document.getElementById('loadStatus');
+      statusEl.textContent = `Loaded ${state.totalMerges} merges (declared vocab size ${state.declaredVocabSize}).`;
+      statusEl.className = 'ok';
+      render();
+    }catch(err){
+      const statusEl = document.getElementById('loadStatus');
+      statusEl.textContent = 'Could not parse that file — expected the format written by Tokenizer.save().';
+      statusEl.className = 'err';
+    }
+  };
+  reader.readAsText(file);
+});
+
+document.getElementById('textInput').addEventListener('input', render);
+render();
+</script>
+</body>
+</html>

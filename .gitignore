@@ -5,3 +5,4 @@ artifacts/*
 !dataset/wikipedia.txt.gz
 *.pt
 transformer_model.pt
+!artifacts/tokenizer-20k.txt
