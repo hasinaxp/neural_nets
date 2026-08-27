@@ -19,16 +19,16 @@ from pretrain_dataset import PretrainTextDataset
 
 
 VOCAB_SIZE = CONFIG.get('vocab_size', 20000)
-SEQ_LEN = 2024
+SEQ_LEN = 1024
 EMBEDDING_DIM = CONFIG.get('embedding_dim', 512)
 NUM_HEADS = 16
-NUM_LAYERS = 24
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-4
-NUM_EPOCHS = 30
+BATCH_SIZE = 8
+NUM_LAYERS = CONFIG.get('n_layers', 26)
+LEARNING_RATE = 2e-5
+NUM_EPOCHS = 1
 GRAD_ACCUM_STEPS = 2
 GRAD_CLIP_NORM = 1.0
-DATASET_BATCH_SIZE = 32
+DATASET_BATCH_SIZE = 16
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ARTIFACTS_DIR = "artifacts"
@@ -53,6 +53,10 @@ logger = logging.getLogger("pretrain")
 
 logger.info(f"Using device: {DEVICE}")
 
+# Reduce noisy third-party INFO logs (HuggingFace datasets, pyarrow, http libs)
+for _lg in ("datasets", "pyarrow", "huggingface_hub", "urllib3", "fsspec", "tokenizers", "transformers"):
+    logging.getLogger(_lg).setLevel(logging.WARNING)
+
 logger.info("[1] Setting up sub-sentence tokenizer...")
 tokenizer = Tokenizer(vocab_size=VOCAB_SIZE)
 tokenizer.load(TOKENIZER_FILE)
@@ -63,15 +67,49 @@ logger.info(f"vocab size {actual_vocab_size}")
 MODEL_VOCAB_SIZE = actual_vocab_size
 
 logger.info("[2] Preparing pretraining dataset...")
-dataset = PretrainTextDataset(batch_size=DATASET_BATCH_SIZE, min_chunk_size=1024, max_chunk_size=3 * 1024)
+dataset = PretrainTextDataset(batch_size=DATASET_BATCH_SIZE, min_chunk_size=1024, max_chunk_size=2 * 1024)
 logger.info(f"   Dataset has ~{len(dataset)} text batches")
 
+# Performance / memory tuning
+torch.backends.cudnn.benchmark = True
 
-def iter_training_batches(dataset, tokenizer, seq_len, batch_size, shuffle=True):
+# Determine num_workers for DataLoader
+_NUM_WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2))
+
+
+def find_max_batch_size(model, seq_len, start_batch, device, dtype=torch.long, min_batch=1):
+    """Probe the largest batch size that fits in GPU memory by trying forward passes.
+    Returns the largest batch size <= start_batch that doesn't raise OOM.
+    """
+    batch = start_batch
+    while batch >= min_batch:
+        try:
+            with torch.no_grad():
+                dummy = torch.zeros((batch, seq_len), dtype=torch.long, device=device)
+                # run a forward pass (no kv cache)
+                model.eval()
+                with torch.amp.autocast(device_type=("cuda" if device.type == "cuda" else None)):
+                    out, _ = model(dummy)
+                del out
+            torch.cuda.empty_cache() if device.type == "cuda" else None
+            return batch
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                batch = batch // 2
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            else:
+                raise
+    return min_batch
+
+
+def iter_training_batches(dataset, tokenizer, seq_len, batch_size):
     """Streams tokenized (xs, ys) training batches by packing tokenized text
     chunks from `dataset` into a running buffer and slicing off fixed-length
     sequences once enough tokens have accumulated."""
-    loader = DataLoader(dataset, batch_size=None, shuffle=shuffle, num_workers=0)
+    # IterableDataset doesn't support shuffling via DataLoader.
+    loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=_NUM_WORKERS)
     chunk_len = seq_len + 1
     buffer = []
 
@@ -105,6 +143,13 @@ logger.info("   Using eager execution mode for training...")
 train_model = base_model
 
 optimizer = torch.optim.Adam(base_model.parameters(), lr=LEARNING_RATE)
+
+# AMP GradScaler for mixed precision training on CUDA
+if DEVICE.type == "cuda":
+    # Use the new torch.amp API to avoid deprecation warnings
+    scaler = torch.amp.GradScaler(device_type="cuda")
+else:
+    scaler = None
 
 step_losses, step_ppls = [], []
 epoch_avg_losses, epoch_avg_ppls = [], []
@@ -161,24 +206,43 @@ for epoch in range(NUM_EPOCHS):
     accum_loss = 0.0
     accum_steps = 0
 
-    batch_iter = iter_training_batches(dataset, tokenizer, SEQ_LEN, BATCH_SIZE, shuffle=True)
+    batch_iter = iter_training_batches(dataset, tokenizer, SEQ_LEN, BATCH_SIZE)
     pbar = tqdm(batch_iter, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", unit="batch")
 
     for xs, ys in pbar:
         xs, ys = xs.to(DEVICE), ys.to(DEVICE)
 
-        with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16, enabled=(DEVICE.type == "cuda")):
+        # Use automatic mixed precision (AMP) + GradScaler on CUDA
+        if DEVICE.type == "cuda":
+            with torch.amp.autocast(device_type="cuda"):
+                loss = train_model.calculate_loss(xs, ys)
+                loss = loss / GRAD_ACCUM_STEPS
+
+            # scale and backprop
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
+        else:
             loss = train_model.calculate_loss(xs, ys)
             loss = loss / GRAD_ACCUM_STEPS
+            loss.backward()
+            accum_loss += loss.item()
 
-        loss.backward()
-        accum_loss += loss.item()
         accum_steps += 1
 
         if accum_steps % GRAD_ACCUM_STEPS == 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), GRAD_CLIP_NORM)
-            optimizer.step()
+            if DEVICE.type == "cuda":
+                # Unscale, clip, step via scaler
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), GRAD_CLIP_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), GRAD_CLIP_NORM)
+                optimizer.step()
+
             optimizer.zero_grad(set_to_none=True)
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
             total_loss += accum_loss
             num_batches += 1
             global_step += 1

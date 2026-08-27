@@ -1,6 +1,7 @@
 import gzip
 import math
 import os
+import bisect  # Added for O(log N) file lookup
 import pandas as pd
 import pyarrow.parquet as pq
 from torch.utils.data import Dataset
@@ -12,7 +13,6 @@ MINIMUM_CHUNK_SIZE = 1024
 MAXIMUM_CHUNK_SIZE = 3 * 1024
 MAX_CORPUS_SIZE = 200 * 1024 ** 2
 
-
 _pretrain_dataset_folders = sorted(os.listdir(RAW_DATASET_FOLDER))
 _pret_data_cached_file = None
 _pret_data_cached_df = None
@@ -20,7 +20,25 @@ _pret_data_cached_df = None
 _all_files = []
 for folder in _pretrain_dataset_folders:
     folder_path = os.path.join(RAW_DATASET_FOLDER, folder)
-    if os.path.isdir(folder_path): _all_files.extend(sorted(os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(".parquet")))
+    if os.path.isdir(folder_path): 
+        _all_files.extend(sorted(os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(".parquet")))
+
+# ==============================================================================
+# OPTIMIZATION: Precompute cumulative row counts for O(log N) random access
+# ==============================================================================
+_file_metadata = []
+_cumulative_rows = []
+_current_cumulative = 0
+
+for filepath in _all_files:
+    try:
+        rows = pq.ParquetFile(filepath).metadata.num_rows
+    except Exception:
+        rows = 0
+    _file_metadata.append((filepath, rows))
+    _current_cumulative += rows
+    _cumulative_rows.append(_current_cumulative)
+# ==============================================================================
 
 def load_processed_chunks(
         index,
@@ -28,53 +46,110 @@ def load_processed_chunks(
         min_chunk_size=MINIMUM_CHUNK_SIZE,
         max_chunk_size=MAXIMUM_CHUNK_SIZE, dataset_folder=None):
     global _pret_data_cached_file, _pret_data_cached_df
-    files = _all_files if dataset_folder is None else sorted(os.path.join(RAW_DATASET_FOLDER, dataset_folder, f) for f in os.listdir(os.path.join(RAW_DATASET_FOLDER, dataset_folder)) if f.endswith(".parquet"))
-    start, end = index * n, index * n + n
+    
+    # Fallback to original logic if a specific dataset_folder is requested
+    if dataset_folder is not None:
+        files = sorted(os.path.join(RAW_DATASET_FOLDER, dataset_folder, f) for f in os.listdir(os.path.join(RAW_DATASET_FOLDER, dataset_folder)) if f.endswith(".parquet"))
+        start, end = index * n, index * n + n
+        for filepath in files:
+            omit_language_check = any(pattern in filepath for pattern in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
+            if _pret_data_cached_file == filepath:
+                df = _pret_data_cached_df
+            else:
+                cols_to_read = ["text"] if omit_language_check else ["text", "language"]
+                df = pd.read_parquet(filepath, columns=cols_to_read)
+                _pret_data_cached_file, _pret_data_cached_df = filepath, df
 
-    for filepath in files:
-        omit_language_check = any(pattern in filepath for pattern in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
+            if start >= (df_len := len(df)):
+                start -= df_len
+                end -= df_len
+                continue
 
-        if _pret_data_cached_file == filepath:
-            df = _pret_data_cached_df
-        else:
-            cols_to_read = ["text"] if omit_language_check else ["text", "language"]
-            df = pd.read_parquet(filepath, columns=cols_to_read)
-            _pret_data_cached_file, _pret_data_cached_df = filepath, df
+            rows = df.iloc[start:end]
+            if omit_language_check:
+                texts = rows["text"].to_numpy()
+            else:
+                texts = rows.loc[rows["language"] == "en", "text"].to_numpy()
 
-        if start >= (df_len := len(df)):
-            start -= df_len
-            end -= df_len
+            chunks = []
+            for text in texts:
+                if not isinstance(text, str): continue
+                text = text.encode("ascii", errors="ignore").decode("ascii")
+                if len(text) <= min_chunk_size: continue
+                if len(text) <= max_chunk_size: chunks.append(text); continue
+
+                while len(text) > max_chunk_size:
+                    split_at = text.rfind("\n\n", 0, max_chunk_size + 1)
+                    if split_at <= 0:
+                        split_at = text.rfind(".\n", 0, max_chunk_size + 1)
+                        if split_at > 0: split_at += 1
+                    if split_at <= 0: split_at = max_chunk_size
+
+                    left, text = text[:split_at].strip(), text[split_at:].strip()
+                    if len(left) > min_chunk_size: chunks.append(left)
+
+                if len(text) > min_chunk_size: chunks.append(text)
+
+            return chunks
+        return []
+
+    # === OPTIMIZED PATH: O(log F) file lookup instead of O(F) sequential scan ===
+    target_global_start = index * n
+    target_global_end = target_global_start + n
+    
+    # Find the exact file containing the target_global_start using binary search
+    file_idx = bisect.bisect_right(_cumulative_rows, target_global_start)
+    
+    if file_idx >= len(_file_metadata):
+        return []
+        
+    filepath, file_rows = _file_metadata[file_idx]
+    prev_cumulative = _cumulative_rows[file_idx - 1] if file_idx > 0 else 0
+    
+    local_start = target_global_start - prev_cumulative
+    local_end = local_start + n
+    
+    omit_language_check = any(pattern in filepath for pattern in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
+    cols_to_read = ["text"] if omit_language_check else ["text", "language"]
+    
+    if _pret_data_cached_file == filepath:
+        df = _pret_data_cached_df
+    else:
+        df = pd.read_parquet(filepath, columns=cols_to_read)
+        _pret_data_cached_file, _pret_data_cached_df = filepath, df
+        
+    if local_start >= len(df):
+        return []
+        
+    rows = df.iloc[local_start:local_end]
+
+    if omit_language_check:
+        texts = rows["text"].to_numpy()
+    else:
+        texts = rows.loc[rows["language"] == "en", "text"].to_numpy()
+
+    chunks = []
+    for text in texts:
+        if not isinstance(text, str): continue
+        text = text.encode("ascii", errors="ignore").decode("ascii")
+        if len(text) <= min_chunk_size: continue
+        if len(text) <= max_chunk_size: 
+            chunks.append(text)
             continue
 
-        rows = df.iloc[start:end]
+        while len(text) > max_chunk_size:
+            split_at = text.rfind("\n\n", 0, max_chunk_size + 1)
+            if split_at <= 0:
+                split_at = text.rfind(".\n", 0, max_chunk_size + 1)
+                if split_at > 0: split_at += 1
+            if split_at <= 0: split_at = max_chunk_size
 
-        if omit_language_check:
-            texts = rows["text"].to_numpy()
-        else:
-            texts = rows.loc[rows["language"] == "en", "text"].to_numpy()
+            left, text = text[:split_at].strip(), text[split_at:].strip()
+            if len(left) > min_chunk_size: chunks.append(left)
 
-        chunks = []
+        if len(text) > min_chunk_size: chunks.append(text)
 
-        for text in texts:
-            if not isinstance(text, str): continue
-            text = text.encode("ascii", errors="ignore").decode("ascii")
-            if len(text) <= min_chunk_size: continue
-            if len(text) <= max_chunk_size: chunks.append(text); continue
-
-            while len(text) > max_chunk_size:
-                split_at = text.rfind("\n\n", 0, max_chunk_size + 1)
-                if split_at <= 0:
-                    split_at = text.rfind(".\n", 0, max_chunk_size + 1)
-                    if split_at > 0: split_at += 1
-                if split_at <= 0: split_at = max_chunk_size
-
-                left, text = text[:split_at].strip(), text[split_at:].strip()
-                if len(left) > min_chunk_size: chunks.append(left)
-
-            if len(text) > min_chunk_size: chunks.append(text)
-
-        return chunks
-    return []
+    return chunks
 
 
 def load_prcessed_wikipedia_chunks(chunk_size=MINIMUM_CHUNK_SIZE):
@@ -121,9 +196,6 @@ def load_prcessed_wikipedia_chunks(chunk_size=MINIMUM_CHUNK_SIZE):
 
 
 class PretrainTextDataset(Dataset):
-    """Combines the parquet-backed pretrain corpus and the wikipedia corpus,
-    yielding fixed-size batches of raw text chunks."""
-
     def __init__(self, batch_size=10, min_chunk_size=MINIMUM_CHUNK_SIZE,
                  max_chunk_size=MAXIMUM_CHUNK_SIZE, dataset_folder=None,
                  include_wikipedia=True, wikipedia_chunk_size=MINIMUM_CHUNK_SIZE):
@@ -163,16 +235,3 @@ class PretrainTextDataset(Dataset):
         wiki_idx = idx - self._num_pretrain_batches
         start = wiki_idx * self.batch_size
         return self.wiki_chunks[start:start + self.batch_size]
-
-
-if __name__ == "__main__":
-    for c in load_processed_chunks(0, 2): print(c, "\n")
-    print("\n======\nchunks2\n======\n")
-    for c in load_processed_chunks(10000, 2): print(c, "\n")
-
-    wiki_chunks = load_prcessed_wikipedia_chunks()
-    print(len(wiki_chunks))
-
-    ds = PretrainTextDataset(batch_size=8)
-    print(len(ds), "batches")
-    print(ds[0][0])

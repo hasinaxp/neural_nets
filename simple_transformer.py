@@ -273,6 +273,8 @@ class Transformer(torch.nn.Module):
         self.n_dim = n_dim
         self.n_seq = n_seq
         self.rope_theta = rope_theta
+        # Enable activation checkpointing to save memory during training
+        self.activation_checkpointing = True
 
         # GQA ratio.
         if n_head <= 4:
@@ -422,36 +424,44 @@ class Transformer(torch.nn.Module):
             x.device,
         )
 
-        aux_loss = 0.0
+        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         x_ = x
 
         for i in range(self.n_layer):
 
-            # Attention block
-            residual = x
-            if i % 4:
-                residual = (residual + x) / 2.0
+            def layer_fn(inp):
+                # Attention block
+                residual = inp
+                if i % 4:
+                    residual = (residual + inp) / 2.0
 
-            y, _ = self.attentions[i](
-                self.attn_norms[i](x),
-                cos,
-                sin,
-                start_pos,
-                kv_cache,
-            )
+                y, _ = self.attentions[i](
+                    self.attn_norms[i](inp),
+                    cos,
+                    sin,
+                    start_pos,
+                    kv_cache,
+                )
 
-            x = residual + self.resid_dropout(y)
+                out1 = residual + self.resid_dropout(y)
 
-            # FFN block
-            residual = x
+                # FFN block
+                y2, a2 = self.ffns[i](
+                    self.ffn_norms[i](out1)
+                )
 
-            y, a = self.ffns[i](
-                self.ffn_norms[i](x)
-            )
+                out2 = out1 + self.resid_dropout(y2)
 
-            x = residual + self.resid_dropout(y)
-            aux_loss += a
+                return out2, torch.tensor(a2, device=out2.device, dtype=out2.dtype)
+
+            if self.activation_checkpointing and self.training:
+                out = torch.utils.checkpoint.checkpoint(layer_fn, x, use_reentrant=False)
+                x, a = out[0], out[1]
+            else:
+                x, a = layer_fn(x)
+
+            aux_loss = aux_loss + a
 
         x = self.final_norm(x)
 

@@ -6,3 +6,4 @@ artifacts/*
 transformer_model.pt
 !artifacts/tokenizer-20k.txt
 !artifacts/tokenizer-32768.txt
+logs/train*
