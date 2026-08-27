@@ -48,7 +48,7 @@ LOG_EVERY = 50
 EVAL_EVERY = 500
 SAMPLE_EVERY = 1000            
 CKPT_EVERY = 500
-SNAPSHOT_EVERY = 5000          # keep a permanent copy this often
+SNAPSHOT_EVERY = 5000          
 PLOT_EVERY = 200
 
 APPLY_RESIDUAL_INIT_SCALING = True
@@ -378,7 +378,7 @@ def save_plots():
     ax_tp.set_xlabel("optimizer step")
 
     fig.tight_layout()
-    fig.savefig(os.path.join(LOG_DIR, "training_curves.png"), dpi=110)
+    fig.savefig(os.path.join(LOG_DIR, "loss_history.png"), dpi=110)
     plt.close(fig)
 
 

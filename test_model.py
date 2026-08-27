@@ -5,10 +5,10 @@ from simple_transformer import Transformer
 from config import CONFIG
 
 VOCAB_SIZE = CONFIG.get('vocab_size', 20000)
-SEQ_LEN = 2024
+SEQ_LEN = CONFIG.get("seq_len", 1024)
 EMBEDDING_DIM = CONFIG.get('embedding_dim', 512)
-NUM_HEADS = 16
-NUM_LAYERS = 24
+NUM_HEADS = CONFIG.get("n_heads", 16)
+NUM_LAYERS = CONFIG.get("seq_len", 1024)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TOKENIZER_FILE = f"artifacts/tokenizer-{VOCAB_SIZE}.txt"

@@ -7,17 +7,18 @@ from tqdm import tqdm
 DATASET_FOLDER = "dataset/raw"
 REPO_TYPE = "dataset"
 
-DEFAULT_DATA_FILE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8]
-DEFAULT_COSMOPEDIA_FILE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+DEFAULT_FINEWEB_FILE_INDICES = [0, 1]
+DEFAULT_FINEWEBEDU_FILE_INDICES = [0, 1, 2, 3, 4, 5]
+DEFAULT_COSMOPEDIA_FILE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 REPOS = {
     "fineweb": {
         "id": "HuggingFaceFW/fineweb",
-        "indices": DEFAULT_DATA_FILE_INDICES,
+        "indices": DEFAULT_FINEWEB_FILE_INDICES,
     },
     "fineweb-edu": {
         "id": "HuggingFaceFW/fineweb-edu",
-        "indices": DEFAULT_DATA_FILE_INDICES,
+        "indices": DEFAULT_FINEWEBEDU_FILE_INDICES,
     },
     "cosmopedia": {
         "id": "HuggingFaceTB/cosmopedia",
