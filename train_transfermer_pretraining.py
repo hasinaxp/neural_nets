@@ -22,11 +22,11 @@ VOCAB_SIZE = CONFIG.get('vocab_size', 20000)
 SEQ_LEN = 1024
 EMBEDDING_DIM = CONFIG.get('embedding_dim', 512)
 NUM_HEADS = 16
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 NUM_LAYERS = CONFIG.get('n_layers', 26)
 LEARNING_RATE = 2e-5
 NUM_EPOCHS = 1
-GRAD_ACCUM_STEPS = 2
+GRAD_ACCUM_STEPS = 4
 GRAD_CLIP_NORM = 1.0
 DATASET_BATCH_SIZE = 16
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -145,11 +145,18 @@ train_model = base_model
 optimizer = torch.optim.Adam(base_model.parameters(), lr=LEARNING_RATE)
 
 # AMP GradScaler for mixed precision training on CUDA
+scaler = None
 if DEVICE.type == "cuda":
-    # Use the new torch.amp API to avoid deprecation warnings
-    scaler = torch.amp.GradScaler(device_type="cuda")
-else:
-    scaler = None
+    # Create a GradScaler in a way that's compatible with multiple PyTorch versions.
+    try:
+        # Preferred: torch.amp.GradScaler() (new unified API)
+        scaler = torch.amp.GradScaler()
+    except Exception:
+        try:
+            # Fallback to older API
+            scaler = torch.cuda.amp.GradScaler(enabled=True)
+        except Exception:
+            scaler = None
 
 step_losses, step_ppls = [], []
 epoch_avg_losses, epoch_avg_ppls = [], []
@@ -198,6 +205,35 @@ logger.info("[4] Training...")
 train_model.train()
 training_start_time = time.time()
 global_step = 0
+
+# Resume support: load latest checkpoint if available
+resume_steps_remaining = 0
+start_epoch = 0
+if os.path.exists(CHECKPOINT_FILE):
+    try:
+        ck = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
+        if "model_state_dict" in ck:
+            base_model.load_state_dict(ck["model_state_dict"])
+        if "optimizer_state_dict" in ck:
+            try:
+                optimizer.load_state_dict(ck["optimizer_state_dict"])
+            except Exception:
+                logger.warning("Failed to fully load optimizer state; continuing without it")
+        if "scaler_state_dict" in ck and scaler is not None:
+            try:
+                scaler.load_state_dict(ck["scaler_state_dict"])
+            except Exception:
+                logger.warning("Failed to load scaler state; continuing")
+
+        resume_global_step = int(ck.get("global_step", 0))
+        resume_epoch = int(ck.get("epoch", 0))
+        # We'll start from the saved epoch and skip already-applied optimizer steps
+        start_epoch = resume_epoch
+        resume_steps_remaining = resume_global_step
+        global_step = resume_global_step
+        logger.info(f"Resuming from checkpoint: epoch={resume_epoch}, global_step={resume_global_step}")
+    except Exception as e:
+        logger.warning(f"Failed to load checkpoint {CHECKPOINT_FILE}: {e}")
 
 for epoch in range(NUM_EPOCHS):
     epoch_start_time = time.time()
@@ -251,7 +287,12 @@ for epoch in range(NUM_EPOCHS):
                 torch.cuda.empty_cache()
             total_loss += accum_loss
             num_batches += 1
-            global_step += 1
+            # If resuming, skip counting/processing until we've skipped resume_steps_remaining
+            if resume_steps_remaining > 0:
+                # we've encountered an optimizer step that was already applied
+                resume_steps_remaining -= 1
+            else:
+                global_step += 1
 
             step_loss = accum_loss
             step_ppl = torch.exp(torch.tensor(step_loss)).item()
@@ -271,6 +312,24 @@ for epoch in range(NUM_EPOCHS):
                 logger.info(f"   step {global_step} | loss {step_loss:.4f} | ppl {step_ppl:.2f}")
                 save_plots()
                 save_metrics()
+
+            # Periodically save checkpoint every 500 optimizer steps
+            if global_step % 500 == 0:
+                logger.info(f"   saving checkpoint at step {global_step} to {CHECKPOINT_FILE}")
+                ck = {
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "model_state_dict": base_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "avg_loss": current_avg_loss,
+                }
+                if scaler is not None:
+                    try:
+                        ck["scaler_state_dict"] = scaler.state_dict()
+                    except Exception:
+                        logger.warning("Could not save scaler state")
+
+                torch.save(ck, CHECKPOINT_FILE)
 
             # ETA calculation and pbar update
             epoch_optim_steps += 1
