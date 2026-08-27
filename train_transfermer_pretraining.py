@@ -20,15 +20,15 @@ from pretrain_dataset import PretrainTextDataset
 
 VOCAB_SIZE = CONFIG.get('vocab_size', 20000)
 SEQ_LEN = 1024
-EMBEDDING_DIM = CONFIG.get('embedding_dim', 512)
+EMBEDDING_DIM = CONFIG.get('embedding_dim', 640)
 NUM_HEADS = 16
-BATCH_SIZE = 16
-NUM_LAYERS = CONFIG.get('n_layers', 26)
+BATCH_SIZE = 32
+NUM_LAYERS = CONFIG.get('n_layers', 20)
 LEARNING_RATE = 2e-5
 NUM_EPOCHS = 1
 GRAD_ACCUM_STEPS = 4
 GRAD_CLIP_NORM = 1.0
-DATASET_BATCH_SIZE = 16
+DATASET_BATCH_SIZE = 32
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ARTIFACTS_DIR = "artifacts"
@@ -72,6 +72,10 @@ logger.info(f"   Dataset has ~{len(dataset)} text batches")
 
 # Performance / memory tuning
 torch.backends.cudnn.benchmark = True
+if DEVICE.type == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 # Determine num_workers for DataLoader
 _NUM_WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2))
@@ -140,6 +144,7 @@ logger.info(f"   Model parameters: {param_count:,}")
 logger.info("   Using eager execution mode for training...")
 # torch.compile is unstable on some Windows CUDA builds for this custom
 # transformer and causes device-side asserts during the RoPE setup.
+torch.compile(base_model)
 train_model = base_model
 
 optimizer = torch.optim.Adam(base_model.parameters(), lr=LEARNING_RATE)
@@ -147,13 +152,16 @@ optimizer = torch.optim.Adam(base_model.parameters(), lr=LEARNING_RATE)
 # AMP GradScaler for mixed precision training on CUDA
 scaler = None
 if DEVICE.type == "cuda":
-    # Create a GradScaler in a way that's compatible with multiple PyTorch versions.
+    # Explicitly train in BF16 on A100 for better throughput and stability.
     try:
-        # Preferred: torch.amp.GradScaler() (new unified API)
-        scaler = torch.amp.GradScaler()
+        scaler = torch.amp.GradScaler(device="cuda", enabled=True)
+    except TypeError:
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=True)
+        except Exception:
+            scaler = None
     except Exception:
         try:
-            # Fallback to older API
             scaler = torch.cuda.amp.GradScaler(enabled=True)
         except Exception:
             scaler = None
@@ -199,6 +207,17 @@ def save_metrics():
             "epoch_avg_losses": epoch_avg_losses,
             "epoch_avg_ppls": epoch_avg_ppls,
         }, f)
+
+
+def log_sample_generation(step):
+    base_model.eval()
+    seed_token = torch.tensor([[tokenizer.special_tokens["<|BOS|>"]]], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        generated = base_model.generate(seed_token, max_count=80)
+    generated_tokens = generated[0].cpu().tolist()
+    generated_text = tokenizer.decode(generated_tokens)
+    logger.info(f"   sample generation at step {step}: {generated_text}")
+    base_model.train()
 
 
 logger.info("[4] Training...")
@@ -254,13 +273,12 @@ for epoch in range(NUM_EPOCHS):
     for xs, ys in pbar:
         xs, ys = xs.to(DEVICE), ys.to(DEVICE)
 
-        # Use automatic mixed precision (AMP) + GradScaler on CUDA
+        # Use explicit BF16 autocast + GradScaler on A100 CUDA.
         if DEVICE.type == "cuda":
-            with torch.amp.autocast(device_type="cuda"):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = train_model.calculate_loss(xs, ys)
                 loss = loss / GRAD_ACCUM_STEPS
 
-            # scale and backprop
             scaler.scale(loss).backward()
             accum_loss += loss.item()
         else:
@@ -312,6 +330,9 @@ for epoch in range(NUM_EPOCHS):
                 logger.info(f"   step {global_step} | loss {step_loss:.4f} | ppl {step_ppl:.2f}")
                 save_plots()
                 save_metrics()
+
+            if global_step % 200 == 0:
+                log_sample_generation(global_step)
 
             # Periodically save checkpoint every 500 optimizer steps
             if global_step % 500 == 0:
