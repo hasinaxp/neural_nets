@@ -85,7 +85,6 @@ torch.manual_seed(SEED)
 if DEVICE.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
 
-# TF32 matmuls: large speedup, negligible quality impact for LM pretraining.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
@@ -95,7 +94,6 @@ logger.info(f"Using device: {DEVICE}")
 if DEVICE.type == "cuda":
     logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# bf16 needs no loss scaling and cannot silently overflow -> prefer it.
 if DEVICE.type == "cuda":
     AMP_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 else:
