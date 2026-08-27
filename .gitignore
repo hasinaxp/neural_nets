@@ -4,6 +4,6 @@ artifacts/*
 !dataset/sample.txt
 !dataset/wikipedia.txt.gz
 transformer_model.pt
-!artifacts/tokenizer-20k.txt
+!artifacts/tokenizer-20000.txt
 !artifacts/tokenizer-32768.txt
 logs/train*
