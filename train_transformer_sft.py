@@ -32,13 +32,35 @@ SEQ_LEN = CONFIG.get("seq_len", 1024)
 MICRO_BATCH_SIZE = 16
 GRAD_ACCUM_STEPS = 2
 NUM_EPOCHS = 3
-PEAK_LR = 3e-5
+PEAK_LR = 1e-5            # was 3e-5. At 3e-5 for three epochs the weights walk
+                          # far enough off the pretrained solution that general
+                          # language modelling degrades -- the model gets fluent
+                          # at the four SFT formats and worse at everything else.
 MIN_LR_RATIO = 0.1
-WARMUP_FRAC = 0.03
+WARMUP_FRAC = 0.05        # longer ramp: the first steps out of a converged
+                          # checkpoint are the ones that do the damage.
 WEIGHT_DECAY = 0.0        # SFT runs are short; decay mostly just fights the
                           # pretrained weights. Raise to 0.01 if you overfit.
 BETAS = (0.9, 0.95)
 GRAD_CLIP_NORM = 1.0
+
+# Pretraining replay -- the other half of the forgetting fix.
+#
+# SFT's objective is narrow: loss only on assistant tokens, over four task
+# formats. Nothing in it asks the model to keep modelling ordinary text, so it
+# drifts. Mixing plain next-token batches from the pretraining corpus back in
+# (rehearsal, in continual-learning terms) keeps the original objective pulling
+# on the same weights. REPLAY_FRAC is the share of *micro-batches* drawn from
+# pretraining rather than SFT.
+REPLAY_FRAC = 0.25
+REPLAY_SEQ_LEN = 512           # shorter than SEQ_LEN: replay is a regularizer,
+                               # not a second pretraining run, and short
+                               # sequences keep the step cost down
+REPLAY_MICRO_BATCH_SIZE = MICRO_BATCH_SIZE
+REPLAY_LOSS_WEIGHT = 1.0       # relative to the SFT loss
+PRETRAIN_TEXT_BATCH = 16       # texts per pretrain-dataset __getitem__
+PRETRAIN_VAL_BATCHES = 12      # held-out pretraining batches, for the
+                               # forgetting curve
 
 # Data
 DATASET_BATCH_SIZE = 64        # conversations per dataset __getitem__
@@ -61,6 +83,7 @@ TOKENIZER_FILE = f"{ARTIFACTS_DIR}/tokenizer-{VOCAB_SIZE}.txt"
 PRETRAINED_MODEL_FILE = f"{ARTIFACTS_DIR}/pretrain_checkpoint_latest.pt"
 TRAINED_MODEL_FILE = f"{ARTIFACTS_DIR}/sft_model.pt"
 CHECKPOINT_FILE = f"{ARTIFACTS_DIR}/sft_checkpoint_latest.pt"
+PRETRAIN_VAL_CACHE = f"{ARTIFACTS_DIR}/val_batches.pt"   # written by pretraining
 
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -214,6 +237,158 @@ def iter_micro_batches(dataset, micro_batch_size, shuffle=True, bucket=True):
 
 
 # ---------------------------------------------------------------------------
+# [2b] Pretraining replay
+# ---------------------------------------------------------------------------
+
+class PretrainReplay:
+    """Endless next-token batches packed from the pretraining corpus.
+
+    Shards are walked sequentially and wrapped around at the end: the loader
+    caches one parquet file at a time, so random access would re-read a shard
+    per batch. Batches carry no IGNORE_INDEX masking -- every token is a
+    target, exactly as during pretraining.
+    """
+
+    def __init__(self, dataset, tokenizer, start_batch=0):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.cursor = int(start_batch)
+
+    def _texts(self):
+        n = max(1, len(self.dataset))
+        empty_streak = 0
+        while True:
+            try:
+                texts = self.dataset[self.cursor % n]
+            except Exception as e:
+                logger.warning(f"    replay: skipped corpus batch {self.cursor} ({e})")
+                texts = []
+            self.cursor += 1
+            usable = [t for t in texts if isinstance(t, str) and t]
+            # A whole pass over the corpus with nothing usable means there is no
+            # corpus. Stop instead of spinning forever.
+            empty_streak = 0 if usable else empty_streak + 1
+            if empty_streak > n:
+                logger.warning("    replay: corpus yielded no usable text; stopping")
+                return
+            yield from usable
+
+    def batches(self, seq_len, batch_size):
+        chunk_len = seq_len + 1
+        buf, seqs = [], []
+        for text in self._texts():
+            buf.extend(self.tokenizer.encode(text))
+            buf.append(EOS_ID)
+            while len(buf) >= chunk_len:
+                seqs.append(buf[:chunk_len])
+                del buf[:chunk_len]
+                if len(seqs) == batch_size:
+                    block = torch.tensor(seqs, dtype=torch.long)
+                    seqs = []
+                    yield block[:, :-1].contiguous(), block[:, 1:].contiguous()
+
+
+def build_replay():
+    """(replay_batch_iterator, held_out_pretrain_batches).
+
+    Returns (None, []) when replay is switched off or the pretraining corpus
+    isn't on this machine -- SFT still runs, it just loses the rehearsal.
+    """
+    if REPLAY_FRAC <= 0:
+        logger.info("    replay disabled (REPLAY_FRAC = 0)")
+        return None, []
+
+    try:
+        # Imported lazily: the module scans dataset/raw at import time, and a
+        # box with only the SFT cache on it should still be able to fine-tune.
+        from pretrain_dataset import PretrainTextDataset
+    except Exception as e:
+        logger.warning(f"    pretraining corpus unavailable ({e}); replay disabled")
+        return None, []
+
+    try:
+        corpus = PretrainTextDataset(
+            batch_size=PRETRAIN_TEXT_BATCH,
+            min_chunk_size=1024,
+            max_chunk_size=2 * 1024,
+            include_wikipedia=False,   # parquet shards only; skips the gz load
+        )
+    except Exception as e:
+        logger.warning(f"    could not open pretraining corpus ({e}); replay disabled")
+        return None, []
+
+    val_batches = []
+    start_batch = 0
+
+    if os.path.exists(PRETRAIN_VAL_CACHE):
+        # Reuse pretraining's own holdout, so the number here is comparable to
+        # the val loss the pretraining run reported.
+        try:
+            blob = torch.load(PRETRAIN_VAL_CACHE, map_location="cpu")
+            for xs, ys in blob["batches"][:PRETRAIN_VAL_BATCHES]:
+                val_batches.append((xs[:, :REPLAY_SEQ_LEN].contiguous(),
+                                    ys[:, :REPLAY_SEQ_LEN].contiguous()))
+            # texts_consumed counts chunks, not corpus batches; divide and add
+            # a margin so replay starts clear of the holdout.
+            start_batch = int(blob.get("texts_consumed", 0)) // PRETRAIN_TEXT_BATCH + 8
+            logger.info(f"    reusing {len(val_batches)} held-out batches from "
+                        f"{PRETRAIN_VAL_CACHE}")
+        except Exception as e:
+            logger.warning(f"    could not read {PRETRAIN_VAL_CACHE}: {e}")
+            val_batches = []
+
+    if not val_batches:
+        holdout = PretrainReplay(corpus, tokenizer)
+        it = holdout.batches(REPLAY_SEQ_LEN, REPLAY_MICRO_BATCH_SIZE)
+        try:
+            for _ in range(PRETRAIN_VAL_BATCHES):
+                val_batches.append(next(it))
+        except StopIteration:
+            pass
+        start_batch = holdout.cursor + 1
+        logger.info(f"    built {len(val_batches)} held-out pretraining batches "
+                    f"from the head of the corpus")
+
+    if not val_batches:
+        logger.warning("    pretraining corpus yielded nothing; replay disabled")
+        return None, []
+
+    replay = PretrainReplay(corpus, tokenizer, start_batch=start_batch)
+    logger.info(f"    replay: {REPLAY_FRAC:.0%} of micro-batches, "
+                f"{REPLAY_MICRO_BATCH_SIZE}x{REPLAY_SEQ_LEN} tokens, "
+                f"weight {REPLAY_LOSS_WEIGHT}, corpus cursor starts at {start_batch}")
+    return replay.batches(REPLAY_SEQ_LEN, REPLAY_MICRO_BATCH_SIZE), val_batches
+
+
+logger.info("[2b] Preparing pretraining replay...")
+replay_iter, PRETRAIN_VAL = build_replay()
+
+
+def mixed_micro_batches(dataset):
+    """Interleave SFT micro-batches with replay batches.
+
+    Yields (xs, ys, tasks, is_replay). An epoch still ends when the SFT data
+    runs out -- replay is infinite and only fills in the chosen share.
+    """
+    rng = random.Random(SEED + 7)
+    sft = iter_micro_batches(dataset, MICRO_BATCH_SIZE)
+    while True:
+        if replay_iter is not None and rng.random() < REPLAY_FRAC:
+            try:
+                rxs, rys = next(replay_iter)
+            except StopIteration:
+                pass
+            else:
+                yield rxs, rys, ["pretrain"] * rxs.size(0), True
+                continue
+        try:
+            xs, ys, tasks = next(sft)
+        except StopIteration:
+            return
+        yield xs, ys, tasks, False
+
+
+# ---------------------------------------------------------------------------
 # [3] Model
 # ---------------------------------------------------------------------------
 
@@ -264,6 +439,9 @@ scaler = torch.amp.GradScaler(enabled=USE_SCALER) if USE_SCALER else None
 # Steps are estimated: collate drops over-length examples, so the true count is
 # slightly lower. The cosine schedule is clamped, so overshooting is harmless.
 est_micro = len(train_dataset) * DATASET_BATCH_SIZE / MICRO_BATCH_SIZE
+if replay_iter is not None:
+    # SFT batches are only (1 - REPLAY_FRAC) of what the loop consumes.
+    est_micro /= max(1e-6, 1.0 - REPLAY_FRAC)
 MAX_STEPS = max(1, int(est_micro / GRAD_ACCUM_STEPS))
 WARMUP_STEPS = max(1, int(WARMUP_FRAC * MAX_STEPS))
 MIN_LR = PEAK_LR * MIN_LR_RATIO
@@ -285,8 +463,9 @@ def lr_at(step):
 
 history = {
     "run_id": RUN_ID,
-    "steps": [], "train_loss": [], "lr": [], "grad_norm": [], "tokens_per_sec": [],
-    "val_steps": [], "val_loss": [], "val_by_task": [],
+    "steps": [], "train_loss": [], "replay_loss": [], "lr": [], "grad_norm": [],
+    "tokens_per_sec": [],
+    "val_steps": [], "val_loss": [], "val_by_task": [], "val_pretrain": [],
 }
 
 
@@ -302,10 +481,20 @@ def save_plots():
         return
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, figsize=(9, 9))
 
-    ax1.plot(history["steps"], history["train_loss"], lw=1, label="train")
+    ax1.plot(history["steps"], history["train_loss"], lw=1, label="train (sft)")
+    if any(v == v for v in history["replay_loss"]):
+        ax1.plot(history["steps"], history["replay_loss"], lw=1, alpha=0.6,
+                 color="tab:green", label="train (replay)")
     if history["val_steps"]:
         ax1.plot(history["val_steps"], history["val_loss"], marker="o", ms=3,
-                 color="tab:red", label="val")
+                 color="tab:red", label="val (sft)")
+    if any(v == v for v in history["val_pretrain"]):
+        ax1.plot(history["val_steps"], history["val_pretrain"], marker="s", ms=3,
+                 ls="--", color="tab:purple", label="val (pretrain)")
+        if base_pretrain_val == base_pretrain_val:
+            # The forgetting line: pretraining val loss should stay near it.
+            ax1.axhline(base_pretrain_val, color="tab:purple", lw=0.8, ls=":",
+                        alpha=0.7)
     ax1.set_ylabel("loss")
     ax1.set_title("SFT")
     ax1.legend()
@@ -329,6 +518,7 @@ def save_plots():
 
 
 VAL_BATCHES = None
+base_pretrain_val = float("nan")
 
 
 def build_val_batches():
@@ -369,6 +559,27 @@ def evaluate():
     return overall, by_task
 
 
+@torch.no_grad()
+def evaluate_pretrain():
+    """Plain next-token loss on held-out pretraining text.
+
+    This is the forgetting metric: SFT val loss can fall the whole run while
+    this one climbs, which is exactly the failure mode being fixed here.
+    """
+    if not PRETRAIN_VAL:
+        return float("nan")
+    train_model.eval()
+    total = torch.zeros((), device=DEVICE)
+    for xs, ys in PRETRAIN_VAL:
+        xs = xs.to(DEVICE, non_blocking=True)
+        ys = ys.to(DEVICE, non_blocking=True)
+        with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE,
+                            enabled=DEVICE.type == "cuda"):
+            total += train_model.calculate_loss(xs, ys).detach()
+    train_model.train()
+    return (total / len(PRETRAIN_VAL)).item()
+
+
 SAMPLE_PROMPTS = [
     ("chat", "Hi! How are you doing today?"),
     ("summarization",
@@ -385,6 +596,15 @@ SAMPLE_PROMPTS = [
      "Write a SQL query that answers the question, using the schema provided.\n\n"
      "Schema:\nCREATE TABLE employees (id INT, name VARCHAR, department VARCHAR, salary INT)\n\n"
      "Question: What is the average salary in the engineering department?"),
+    ("math",
+     "Solve the problem below. Show your reasoning, then give the final answer.\n\n"
+     "Natalia sold clips to 48 of her friends in April, and then she sold half "
+     "as many clips in May. How many clips did Natalia sell altogether in April "
+     "and May?"),
+    ("reasoning",
+     "Choose the option that best answers the question.\n\n"
+     "What do people use to write on paper?\n\n"
+     "A) pen\nB) car\nC) river\nD) cloud"),
 ]
 
 
@@ -447,6 +667,12 @@ if os.path.exists(CHECKPOINT_FILE):
         if isinstance(ck.get("history"), dict):
             history.update({k: v for k, v in ck["history"].items() if k in history})
             history["run_id"] = RUN_ID
+            # Checkpoints from before replay existed have no replay/pretrain
+            # series; pad them with NaN so the plots stay aligned.
+            for key, ref in (("replay_loss", "steps"), ("val_pretrain", "val_steps")):
+                missing = len(history[ref]) - len(history[key])
+                if missing > 0:
+                    history[key] = [float("nan")] * missing + history[key]
         last_val_loss = float(ck.get("val_loss", float("nan")))
         logger.info(f"Resumed: epoch={start_epoch}, step={global_step}")
     except Exception as e:
@@ -460,17 +686,24 @@ logger.info("[4] Training...")
 VAL_BATCHES = build_val_batches()
 
 base_val, base_by_task = evaluate()
+base_pretrain_val = evaluate_pretrain()
 logger.info(f"    pretrained baseline val loss {base_val:.4f}")
 for task, v in sorted(base_by_task.items()):
     logger.info(f"      {task:15s} {v:.4f}")
+logger.info(f"    pretraining baseline val loss {base_pretrain_val:.4f} "
+            f"(watch this one for forgetting)")
 
 train_model.train()
 optimizer.zero_grad(set_to_none=True)
 
 training_start = time.time()
 accum_loss = torch.zeros((), device=DEVICE)
+accum_replay_loss = torch.zeros((), device=DEVICE)
 accum_micro = 0
+accum_sft_micro = 0
+accum_replay_micro = 0
 accum_tokens = 0
+replay_micro_total = 0
 skipped_steps = 0
 step_timer = time.time()
 stop = False
@@ -481,20 +714,31 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     logger.info(f"--- Epoch {epoch + 1}/{NUM_EPOCHS} ---")
     pbar = tqdm(desc=f"epoch {epoch + 1}", unit="step")
 
-    for xs, ys, tasks in iter_micro_batches(train_dataset, MICRO_BATCH_SIZE):
+    for xs, ys, tasks, is_replay in mixed_micro_batches(train_dataset):
         xs = xs.to(DEVICE, non_blocking=True)
         ys = ys.to(DEVICE, non_blocking=True)
 
         with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE,
                             enabled=DEVICE.type == "cuda"):
-            loss = train_model.calculate_loss(xs, ys) / GRAD_ACCUM_STEPS
+            loss = train_model.calculate_loss(xs, ys)
+            if is_replay:
+                loss = loss * REPLAY_LOSS_WEIGHT
+            loss = loss / GRAD_ACCUM_STEPS
 
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        accum_loss += loss.detach()
+        # The two objectives sit at different scales, so they are tracked
+        # apart -- one blended number would just wobble with the mix.
+        if is_replay:
+            accum_replay_loss += loss.detach()
+            accum_replay_micro += 1
+            replay_micro_total += 1
+        else:
+            accum_loss += loss.detach()
+            accum_sft_micro += 1
         accum_micro += 1
         accum_tokens += int((ys != IGNORE_INDEX).sum())
 
@@ -523,9 +767,22 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         optimizer.zero_grad(set_to_none=True)
 
-        step_loss = accum_loss.item()
+        # one host sync for both objectives; undo the /GRAD_ACCUM_STEPS so the
+        # numbers are per-micro-batch means regardless of the step's mix
+        sums = torch.stack([accum_loss, accum_replay_loss]).tolist()
+        if accum_sft_micro:
+            step_loss = sums[0] * GRAD_ACCUM_STEPS / accum_sft_micro
+        else:
+            step_loss = history["train_loss"][-1] if history["train_loss"] else float("nan")
+        step_replay_loss = float("nan")
+        if accum_replay_micro:
+            step_replay_loss = (sums[1] * GRAD_ACCUM_STEPS
+                                / (accum_replay_micro * max(1e-6, REPLAY_LOSS_WEIGHT)))
         accum_loss.zero_()
+        accum_replay_loss.zero_()
         accum_micro = 0
+        accum_sft_micro = 0
+        accum_replay_micro = 0
         global_step += 1
 
         step_time = time.time() - step_timer
@@ -537,6 +794,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         history["steps"].append(global_step)
         history["train_loss"].append(step_loss)
+        history["replay_loss"].append(step_replay_loss)
         history["lr"].append(lr)
         history["grad_norm"].append(float(grad_norm))
         history["tokens_per_sec"].append(tok_per_sec)
@@ -544,27 +802,38 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         pbar.update(1)
         pbar.set_postfix({
             "loss": f"{step_loss:.4f}",
+            "replay": f"{step_replay_loss:.3f}",
             "ppl": f"{math.exp(min(20, step_loss)):.1f}",
             "lr": f"{lr:.2e}",
             "gn": f"{float(grad_norm):.2f}",
         })
 
         if global_step % LOG_EVERY == 0:
-            recent = history["train_loss"][-LOG_EVERY:]
+            recent = [v for v in history["train_loss"][-LOG_EVERY:] if v == v]
+            rec_replay = [v for v in history["replay_loss"][-LOG_EVERY:] if v == v]
+            replay_txt = (f" | replay {sum(rec_replay)/len(rec_replay):.4f}"
+                          if rec_replay else "")
             logger.info(f"    step {global_step}/{MAX_STEPS} | "
-                        f"loss {sum(recent)/len(recent):.4f} | lr {lr:.2e} | "
-                        f"gn {float(grad_norm):.2f} | "
+                        f"loss {sum(recent)/max(1, len(recent)):.4f}{replay_txt} | "
+                        f"lr {lr:.2e} | gn {float(grad_norm):.2f} | "
                         f"{tok_per_sec:.0f} sup-tok/s")
 
         if global_step % EVAL_EVERY == 0:
             last_val_loss, by_task = evaluate()
+            pre_val = evaluate_pretrain()
             history["val_steps"].append(global_step)
             history["val_loss"].append(last_val_loss)
             history["val_by_task"].append(by_task)
+            history["val_pretrain"].append(pre_val)
             deltas = " ".join(
                 f"{t}={by_task[t]:.3f}({by_task[t] - base_by_task.get(t, by_task[t]):+.3f})"
                 for t in sorted(by_task))
             logger.info(f"    >> val {last_val_loss:.4f} | {deltas}")
+            if pre_val == pre_val:
+                drift = pre_val - base_pretrain_val
+                warn = "  <-- forgetting" if drift > 0.15 else ""
+                logger.info(f"    >> pretrain val {pre_val:.4f} "
+                            f"({drift:+.4f} vs baseline){warn}")
 
         if global_step % SAMPLE_EVERY == 0:
             log_samples(global_step)
@@ -582,24 +851,34 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     if accum_micro:
         optimizer.zero_grad(set_to_none=True)
         accum_loss.zero_()
+        accum_replay_loss.zero_()
         accum_micro = 0
+        accum_sft_micro = 0
+        accum_replay_micro = 0
 
     val, by_task = evaluate()
-    logger.info(f"    epoch {epoch + 1} val loss {val:.4f}")
+    pre_val = evaluate_pretrain()
+    logger.info(f"    epoch {epoch + 1} val loss {val:.4f} | pretrain val "
+                f"{pre_val:.4f} ({pre_val - base_pretrain_val:+.4f} vs baseline)")
     snap = f"{ARTIFACTS_DIR}/sft_model_epoch{epoch + 1}.pt"
     atomic_save(model.state_dict(), snap)
     logger.info(f"    epoch snapshot -> {snap}")
     save_checkpoint(CHECKPOINT_FILE, global_step, epoch + 1, val)
 
 last_val_loss, by_task = evaluate()
+final_pretrain_val = evaluate_pretrain()
 history["val_steps"].append(global_step)
 history["val_loss"].append(last_val_loss)
 history["val_by_task"].append(by_task)
+history["val_pretrain"].append(final_pretrain_val)
 
 logger.info(f"Final val loss {last_val_loss:.4f} (baseline {base_val:.4f})")
 for task in sorted(by_task):
     delta = by_task[task] - base_by_task.get(task, by_task[task])
     logger.info(f"    {task:15s} {by_task[task]:.4f} ({delta:+.4f} vs pretrained)")
+logger.info(f"    {'pretrain':15s} {final_pretrain_val:.4f} "
+            f"({final_pretrain_val - base_pretrain_val:+.4f} vs pretrained) "
+            f"| {replay_micro_total:,} replay micro-batches mixed in")
 
 atomic_save(model.state_dict(), TRAINED_MODEL_FILE)
 save_checkpoint(CHECKPOINT_FILE, global_step, NUM_EPOCHS, last_val_loss)

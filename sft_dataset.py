@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import re
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -18,12 +19,16 @@ SEED = 1337
 
 # Share of the training mixture per task. Raw row counts are wildly unbalanced
 # (SQL alone is ~185k rows), so the index is resampled to hit these instead.
+# The original five tasks are scaled by 0.8 to free up 0.20 for math/reasoning,
+# rather than picking new numbers from scratch.
 TASK_WEIGHTS = {
-    "chat": 0.35,
-    "extractive_qa": 0.20,
-    "summarization": 0.15,
-    "sql": 0.20,
-    "instruct": 0.10,
+    "chat": 0.28,
+    "extractive_qa": 0.16,
+    "summarization": 0.12,
+    "sql": 0.16,
+    "instruct": 0.08,
+    "math": 0.10,
+    "reasoning": 0.10,
 }
 
 VAL_PER_TASK = 300          # held-out examples per task
@@ -52,6 +57,16 @@ NO_ANSWER_REPLIES = [
     "The passage doesn't say.",
     "I can't answer that from the given passage.",
     "That information isn't in the context.",
+]
+MATH_PROMPTS = [
+    "Solve the problem below. Show your reasoning, then give the final answer.",
+    "Work through this math problem step by step.",
+    "Solve this word problem, explaining your steps as you go.",
+]
+REASONING_PROMPTS = [
+    "Answer the question by choosing the correct option below.",
+    "Choose the option that best answers the question.",
+    "Pick the correct choice for the question below.",
 ]
 
 
@@ -191,6 +206,53 @@ def _from_gretel_sql(row, rng):
             {"role": "assistant", "content": query}]
 
 
+_GSM8K_CALC = re.compile(r"<<[^>]*>>")   # calculator annotations, e.g. <<48/2=24>>
+
+
+def _from_gsm8k(row, rng):
+    """gsm8k: `answer` is a worked solution ending in '#### <final number>'."""
+    question = _clean(row.get("question"))
+    raw = row.get("answer")
+    if not question or not isinstance(raw, str) or "####" not in raw:
+        return None
+    steps, _, final = raw.partition("####")
+    steps = _clean(_GSM8K_CALC.sub("", steps))
+    final = _clean(final)
+    if not steps or not final:
+        return None
+    prompt = f"{rng.choice(MATH_PROMPTS)}\n\n{question}"
+    reply = f"{steps}\nThe answer is {final}."
+    return [{"role": "user", "content": prompt},
+            {"role": "assistant", "content": reply}]
+
+
+def _from_mcq_reasoning(row, rng):
+    """ai2_arc / commonsense_qa: multiple-choice, `choices` is {text, label},
+    `answerKey` names the correct label. No rationale is provided upstream, so
+    the reply is just the chosen option -- the prompt only asks for that."""
+    question = _clean(row.get("question"))
+    choices = row.get("choices") or {}
+    texts = list(choices.get("text") or [])
+    labels = list(choices.get("label") or [])
+    answer_key = row.get("answerKey")
+    if not question or not answer_key or len(texts) != len(labels) or len(texts) < 2:
+        return None
+    try:
+        idx = labels.index(answer_key)
+    except ValueError:
+        return None
+    answer_text = _clean(texts[idx])
+    if not answer_text:
+        return None
+    options = "\n".join(f"{lab}) {_clean(t)}" for lab, t in zip(labels, texts) if _clean(t))
+    if not options:
+        return None
+    prompt = f"{rng.choice(REASONING_PROMPTS)}\n\n{question}\n\n{options}"
+    reply = f"{answer_key}) {answer_text}"
+    return [{"role": "user", "content": prompt},
+            {"role": "assistant", "content": reply}]
+
+
 DOLLY_DROP_CATEGORIES = ("closed_qa", "open_qa", "general_qa")
 
 
@@ -222,6 +284,9 @@ NORMALIZERS = {
     "sql-create-context": _from_sql_create_context,
     "synthetic-text-to-sql": _from_gretel_sql,
     "dolly": _from_dolly,
+    "gsm8k": _from_gsm8k,
+    "arc-challenge": _from_mcq_reasoning,
+    "commonsense-qa": _from_mcq_reasoning,
 }
 
 

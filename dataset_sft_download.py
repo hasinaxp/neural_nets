@@ -85,6 +85,25 @@ REPOS = {
         "task": "instruct",
         "max_rows": None,
     },
+    # ---- math (chain-of-thought word problems) -----------------------------
+    "gsm8k": {
+        "id": "openai/gsm8k",
+        "task": "math",
+        "config": "main",            # repo also has a "socratic" variant
+        "max_rows": None,            # ~7.5k train rows
+    },
+    # ---- reasoning (grounded multiple-choice) -------------------------------
+    "arc-challenge": {
+        "id": "allenai/ai2_arc",
+        "task": "reasoning",
+        "config": "ARC-Challenge",   # repo also has ARC-Easy
+        "max_rows": None,            # ~1.1k train rows
+    },
+    "commonsense-qa": {
+        "id": "tau/commonsense_qa",
+        "task": "reasoning",
+        "max_rows": None,            # ~9.7k train rows; test split has no labels
+    },
 }
 
 
