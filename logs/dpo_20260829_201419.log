@@ -1,0 +1,71 @@
+2026-08-29 20:14:19,382 [INFO] Using device: cuda
+2026-08-29 20:14:19,402 [INFO] GPU: NVIDIA A100-SXM4-80GB
+2026-08-29 20:14:19,402 [INFO] AMP dtype: torch.bfloat16 (grad scaler: False)
+2026-08-29 20:14:19,402 [INFO] [1] Loading tokenizer...
+2026-08-29 20:14:19,437 [INFO]     tokenizer vocab 32768 -> model vocab 32768
+2026-08-29 20:14:19,437 [INFO] [2] Preparing preference dataset...
+2026-08-29 20:14:22,814 [INFO]     train: 20,553 pairs in 322 batches of 64
+      harmless     NO DATA -- weight redistributed
+      helpful      used  12,846 of  37,390 (0.34x)
+      instruct     used   7,707 of   3,854 (2.0x)
+2026-08-29 20:14:22,815 [INFO]     val: 800 pairs
+2026-08-29 20:14:22,815 [INFO] [3] Loading policy and reference models...
+2026-08-29 20:14:23,611 [INFO]     starting from artifacts/sft_checkpoint_latest.pt
+2026-08-29 20:14:24,867 [INFO]     policy: 109,473,920 params
+2026-08-29 20:14:26,072 [INFO]     reference: frozen copy, dtype torch.bfloat16
+2026-08-29 20:14:27,646 [INFO]     torch.compile enabled (mode=default); one warmup per length bucket
+2026-08-29 20:14:27,647 [INFO]     ~644 optimizer steps over 1 epoch(s) | warmup 64 | LR 5.00e-06 -> 5.00e-07 | beta 0.1 | nll weight 0.2
+2026-08-29 20:14:27,648 [INFO] [4] Training...
+2026-08-29 20:14:28,484 [INFO]     100 validation micro-batches
+2026-08-29 20:15:26,368 [INFO]     SFT baseline: dpo loss 0.6930 | reward acc 0.517 | margin +0.0007
+2026-08-29 20:15:26,368 [INFO]     (policy == reference at step 0, so margin is 0 and loss is log 2 = 0.6931 by construction)
+2026-08-29 20:15:26,369 [INFO]       helpful      loss 0.6935  acc 0.512
+2026-08-29 20:15:26,369 [INFO]       instruct     loss 0.6925  acc 0.522
+2026-08-29 20:15:26,370 [INFO] --- Epoch 1/1 ---
+2026-08-29 20:15:56,479 [INFO]     step 25/644 | loss 0.6866 | acc 0.550 | margin +0.0248 | logp c/r -1064.8/-771.4 | lr 1.95e-06 | gn 37.11
+2026-08-29 20:16:06,832 [INFO]     step 50/644 | loss 0.6397 | acc 0.666 | margin +0.1505 | logp c/r -534.2/-519.3 | lr 3.91e-06 | gn 22.42
+2026-08-29 20:16:17,475 [INFO]     step 75/644 | loss 0.5997 | acc 0.671 | margin +0.4014 | logp c/r -624.3/-617.9 | lr 5.00e-06 | gn 24.37
+2026-08-29 20:16:28,183 [INFO]     step 100/644 | loss 0.6122 | acc 0.673 | margin +0.5989 | logp c/r -838.4/-691.7 | lr 4.96e-06 | gn 32.39
+2026-08-29 20:16:39,091 [INFO]     step 125/644 | loss 0.6025 | acc 0.690 | margin +0.3889 | logp c/r -633.4/-550.7 | lr 4.88e-06 | gn 26.28
+2026-08-29 20:16:49,092 [INFO]     step 150/644 | loss 0.5984 | acc 0.677 | margin +0.6347 | logp c/r -574.6/-521.4 | lr 4.77e-06 | gn 20.16
+2026-08-29 20:16:59,879 [INFO]     step 175/644 | loss 0.5819 | acc 0.679 | margin +0.4392 | logp c/r -588.3/-610.1 | lr 4.61e-06 | gn 24.80
+2026-08-29 20:17:10,450 [INFO]     step 200/644 | loss 0.5524 | acc 0.708 | margin +0.4073 | logp c/r -874.9/-774.7 | lr 4.42e-06 | gn 28.63
+2026-08-29 20:17:15,370 [INFO]     >> val loss 0.5876 | acc 0.683 (baseline 0.500) | margin +0.5034 | helpful=0.61 instruct=0.76
+2026-08-29 20:17:16,691 [INFO]     checkpoint saved at step 200
+2026-08-29 20:17:27,598 [INFO]     step 225/644 | loss 0.5780 | acc 0.680 | margin +0.4651 | logp c/r -617.9/-446.9 | lr 4.21e-06 | gn 29.24
+2026-08-29 20:17:38,118 [INFO]     step 250/644 | loss 0.5377 | acc 0.721 | margin +0.6969 | logp c/r -528.1/-609.3 | lr 3.96e-06 | gn 25.73
+2026-08-29 20:17:48,420 [INFO]     step 275/644 | loss 0.5736 | acc 0.683 | margin +0.6887 | logp c/r -486.4/-491.0 | lr 3.69e-06 | gn 21.79
+2026-08-29 20:17:59,281 [INFO]     step 300/644 | loss 0.5589 | acc 0.700 | margin +0.4731 | logp c/r -638.0/-526.5 | lr 3.41e-06 | gn 28.54
+2026-08-29 20:18:10,294 [INFO]     step 325/644 | loss 0.5501 | acc 0.704 | margin +1.1146 | logp c/r -616.3/-683.8 | lr 3.11e-06 | gn 51.40
+2026-08-29 20:18:21,168 [INFO]     step 350/644 | loss 0.5291 | acc 0.723 | margin +0.5831 | logp c/r -612.5/-542.6 | lr 2.81e-06 | gn 24.39
+2026-08-29 20:18:32,243 [INFO]     step 375/644 | loss 0.5226 | acc 0.740 | margin +1.0345 | logp c/r -607.5/-500.8 | lr 2.51e-06 | gn 17.15
+2026-08-29 20:18:42,758 [INFO]     step 400/644 | loss 0.5210 | acc 0.729 | margin +0.7772 | logp c/r -845.2/-674.1 | lr 2.21e-06 | gn 24.00
+2026-08-29 20:18:47,682 [INFO]     >> val loss 0.5821 | acc 0.703 (baseline 0.500) | margin +0.5342 | helpful=0.64 instruct=0.77
+2026-08-29 20:20:16,362 [INFO]     [chat] To enhance the user experience and improve the user experience, we've got a few key features that you can take advantage of:  1. **Functionality**: We've built-in functions that take a single function as input. These fun
+2026-08-29 20:21:29,247 [INFO]     [helpful] Sound quality is a crucial aspect of a laptop fan. When you use a laptop fan, it's important to carefully examine the setup and ensure the installations are working smoothly. Here are some common issues that may arise:  
+2026-08-29 20:21:30,450 [INFO]     [instruct] A hash table is a data structure that provides a unique identifier for a given element. A hash table is a mathematical object that allows for the creation of unique keys and data types for the given element.  A hash tabl
+2026-08-29 20:21:31,653 [INFO]     [harmless] A good way to handle a neighbor who plays loud music at 3am is to get a friendly voice. Here's a great way to handle a neighbor who plays loud music:  1. Find a friend who can help you with the problem. 2. Ask them to he
+2026-08-29 20:21:32,949 [INFO]     checkpoint saved at step 400
+2026-08-29 20:21:43,792 [INFO]     step 425/644 | loss 0.5207 | acc 0.727 | margin +0.9624 | logp c/r -868.3/-716.5 | lr 1.92e-06 | gn 20.91
+2026-08-29 20:21:54,674 [INFO]     step 450/644 | loss 0.5281 | acc 0.721 | margin +0.5995 | logp c/r -431.6/-508.5 | lr 1.64e-06 | gn 28.16
+2026-08-29 20:22:06,956 [INFO]     step 475/644 | loss 0.5326 | acc 0.718 | margin +0.4611 | logp c/r -843.8/-895.3 | lr 1.39e-06 | gn 27.91
+2026-08-29 20:22:17,342 [INFO]     step 500/644 | loss 0.5228 | acc 0.752 | margin +0.8404 | logp c/r -381.1/-487.9 | lr 1.16e-06 | gn 19.63
+2026-08-29 20:22:29,209 [INFO]     step 525/644 | loss 0.5097 | acc 0.719 | margin +0.5767 | logp c/r -342.2/-318.8 | lr 9.59e-07 | gn 19.08
+2026-08-29 20:22:39,382 [INFO]     step 550/644 | loss 0.5372 | acc 0.748 | margin +0.8600 | logp c/r -730.5/-673.1 | lr 7.91e-07 | gn 20.81
+2026-08-29 20:22:50,120 [INFO]     step 575/644 | loss 0.4933 | acc 0.750 | margin +1.0530 | logp c/r -660.5/-534.8 | lr 6.60e-07 | gn 18.38
+2026-08-29 20:23:00,669 [INFO]     step 600/644 | loss 0.5236 | acc 0.732 | margin +0.4264 | logp c/r -602.6/-554.6 | lr 5.67e-07 | gn 30.68
+2026-08-29 20:23:05,577 [INFO]     >> val loss 0.5741 | acc 0.704 (baseline 0.500) | margin +0.5983 | helpful=0.64 instruct=0.77
+2026-08-29 20:23:07,680 [INFO]     checkpoint saved at step 600
+2026-08-29 20:23:18,002 [INFO]     step 625/644 | loss 0.5089 | acc 0.753 | margin +0.7007 | logp c/r -257.1/-318.2 | lr 5.13e-07 | gn 14.66
+2026-08-29 20:23:30,556 [INFO]     epoch 1 val loss 0.5736 | reward acc 0.703
+2026-08-29 20:23:31,131 [INFO]     epoch snapshot -> artifacts/dpo_model_epoch1.pt
+2026-08-29 20:23:37,816 [INFO] Final val loss 0.5736 (baseline 0.6930) | reward acc 0.703 (baseline 0.517)
+2026-08-29 20:23:37,816 [INFO]     helpful      acc 0.642 (+0.130) | margin +0.2566
+2026-08-29 20:23:37,816 [INFO]     instruct     acc 0.762 (+0.240) | margin +0.9545
+2026-08-29 20:23:39,628 [INFO] Total time: 0:08:13 | steps 642 | skipped 0
+2026-08-29 20:23:39,629 [INFO] Model saved to artifacts/dpo_model.pt
+2026-08-29 20:23:39,629 [INFO] [5] Final samples...
+2026-08-29 20:23:40,505 [INFO]     [chat] I am starting a new project in the area of communication and collaboration. I have been working on a project that has focused on communication and collaboration. This project has focused on creating a collaborative envir
+2026-08-29 20:23:41,714 [INFO]     [helpful] 1. Use a safety net or a safety net that can help you keep the laptop away from the TV. 2. Make sure your laptop is not too close to the TV and is not too far from the TV. 3. If your laptop is not far from the TV, turn i
+2026-08-29 20:23:42,920 [INFO]     [instruct] A hash table is a table that is designed to keep records of all possible combinations of its parameters. In this case, the user is creating a hash table with the parameters `x`, `y`, and `z`. The hash table can be used t
+2026-08-29 20:23:44,126 [INFO]     [harmless] I'm happy to help you with that. Here's a great way to handle a neighbor who plays loud music at 3am:  1. Listen to your neighbor's song (and then listen to it in your ear). 2. Let them listen to it. 3. Have a good time 

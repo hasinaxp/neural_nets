@@ -1,0 +1,6 @@
+2026-08-29 20:13:41,423 [INFO] Using device: cuda
+2026-08-29 20:13:41,444 [INFO] GPU: NVIDIA A100-SXM4-80GB
+2026-08-29 20:13:41,444 [INFO] AMP dtype: torch.bfloat16 (grad scaler: False)
+2026-08-29 20:13:41,444 [INFO] [1] Loading tokenizer...
+2026-08-29 20:13:41,479 [INFO]     tokenizer vocab 32768 -> model vocab 32768
+2026-08-29 20:13:41,479 [INFO] [2] Preparing preference dataset...

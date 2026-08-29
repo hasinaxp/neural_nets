@@ -81,6 +81,13 @@ def _clean(text):
     return text.encode("ascii", errors="ignore").decode("ascii").strip()
 
 
+def _as_list(seq):
+    """List-ify a sequence that may be a numpy array (no truthiness) or None."""
+    if seq is None:
+        return []
+    return list(seq)
+
+
 def _from_messages(row, rng):
     """smoltalk / no_robots: already a list of {role, content}."""
     msgs = row.get("messages")
@@ -231,9 +238,13 @@ def _from_mcq_reasoning(row, rng):
     `answerKey` names the correct label. No rationale is provided upstream, so
     the reply is just the chosen option -- the prompt only asks for that."""
     question = _clean(row.get("question"))
-    choices = row.get("choices") or {}
-    texts = list(choices.get("text") or [])
-    labels = list(choices.get("label") or [])
+    choices = row.get("choices")
+    if not isinstance(choices, dict):
+        return None
+    # Parquet -> pandas hands these back as numpy arrays, which have no usable
+    # truth value, so length-check instead of leaning on `or []`.
+    texts = _as_list(choices.get("text"))
+    labels = _as_list(choices.get("label"))
     answer_key = row.get("answerKey")
     if not question or not answer_key or len(texts) != len(labels) or len(texts) < 2:
         return None

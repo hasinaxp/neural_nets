@@ -2,7 +2,9 @@ import json
 import logging
 import math
 import os
+import queue
 import random
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -11,8 +13,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, get_worker_info
+from torch.utils.data import (DataLoader, Dataset, IterableDataset, Subset,
+                              get_worker_info)
 from tqdm import tqdm
 
 from tokenizer import Tokenizer
@@ -26,11 +30,17 @@ SEED = 1337
 VOCAB_SIZE = CONFIG.get("vocab_size", 20000)
 EMBEDDING_DIM = CONFIG.get("embedding_dim", 512)
 NUM_LAYERS = CONFIG.get("n_layers", 16)
-NUM_HEADS = CONFIG.get("n_heads", 16)
-SEQ_LEN = CONFIG.get("seq_len", 1024)
+# head_dim must land on 64 (or 32/128): the flash-attention kernels are only
+# compiled for those. 640/16 = 40 silently falls back to the math kernel and
+# costs more than everything else on this list put together.
+NUM_HEADS = CONFIG.get("n_heads") or max(1, EMBEDDING_DIM // 64)
+SEQ_LEN = CONFIG.get("seq_len", CONFIG.get("sequence_length", 1024))
 
-MICRO_BATCH_SIZE = 32          # sequences per forward pass
-GRAD_ACCUM_STEPS = 4           # -> 32 * 1024 * 4 = 131,072 tokens per step
+# Same 131,072 tokens/step, but in 2 fat passes instead of 4 thin ones: fewer
+# kernel launches and Python-side steps per token, and the matmuls are shaped
+# better. Override per-GPU with MICRO_BATCH / GRAD_ACCUM.
+MICRO_BATCH_SIZE = int(os.environ.get("MICRO_BATCH", "64"))   # sequences per forward pass
+GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM", "2"))
 MAX_STEPS = CONFIG.get("max_steps", 17000)   # ~2.2B tokens ~= 20 tok/param here
 PEAK_LR = 5e-4                 # 131k tokens/step supports a slightly higher peak
 MIN_LR_RATIO = 0.1             # final LR = PEAK_LR * this
@@ -52,9 +62,13 @@ SNAPSHOT_EVERY = 5000
 PLOT_EVERY = 200
 
 APPLY_RESIDUAL_INIT_SCALING = True
-USE_COMPILE = os.environ.get("USE_COMPILE", "0") == "1"
+USE_COMPILE = os.environ.get("USE_COMPILE", "1") == "1"
+COMPILE_MODE = os.environ.get("COMPILE_MODE", "default")
+PREFETCH = os.environ.get("PREFETCH", "1") == "1"
+LOSS_CHUNK_SIZE = int(os.environ.get("LOSS_CHUNK_SIZE", "512"))
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_PIN_MEMORY = DEVICE.type == "cuda"
 
 ARTIFACTS_DIR = "artifacts"
 LOG_DIR = "logs"
@@ -89,6 +103,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
+if DEVICE.type == "cuda":
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 logger.info(f"Using device: {DEVICE}")
 if DEVICE.type == "cuda":
@@ -125,14 +142,19 @@ dataset = PretrainTextDataset(
 logger.info(f"    Dataset has ~{len(dataset)} text batches")
 
 
-_DATASET_SHARDS = bool(getattr(dataset, "shards_by_worker", False))
-_NUM_WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2)) if _DATASET_SHARDS else 0
-if not _DATASET_SHARDS:
+# A map-style Dataset (this one) is safe with multiple workers: the DataLoader
+# hands each worker a disjoint slice of indices and reassembles them in order,
+# so the stream stays byte-for-byte deterministic. Only an *iterable* dataset
+# has to shard itself.
+if isinstance(dataset, IterableDataset) and not bool(getattr(dataset, "shards_by_worker", False)):
+    _NUM_WORKERS = 0
     logger.warning(
-        "    PretrainTextDataset does not declare `shards_by_worker`; using num_workers=0 "
-        "to avoid feeding each example N times. Add worker sharding in its __iter__ "
-        "(see get_worker_info) and set self.shards_by_worker = True to re-enable workers."
+        "    IterableDataset without `shards_by_worker`; forcing num_workers=0 so each "
+        "example is not replayed once per worker. Shard its __iter__ on get_worker_info()."
     )
+else:
+    _NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "6"))
+logger.info(f"    dataloader workers: {_NUM_WORKERS} | background prefetch: {PREFETCH}")
 
 
 def shard_by_worker(iterable):
@@ -146,76 +168,254 @@ def shard_by_worker(iterable):
             yield item
 
 
+def _identity(item):
+    """Keep DataLoader's default_convert from turning our int32 numpy arrays
+    into torch tensors (and back again a moment later)."""
+    return item
+
+
+class TokenizedItems(Dataset):
+    """Parquet read + BPE encode for one dataset item, run inside the worker.
+
+    This is the whole point of the worker processes. `Tokenizer.encode` is pure
+    Python -- a regex split plus a dict-cached merge loop per word -- and at
+    131k tokens per optimizer step it does not keep up with an A100 on one core
+    while also holding the GIL against the training loop. Doing it here puts it
+    in N separate interpreters, ahead of time, and hands back int32 arrays that
+    cost nothing to pack.
+    """
+
+    def __init__(self, base, tokenizer, eos_id):
+        self.base = base
+        self.tokenizer = tokenizer
+        self.eos_id = eos_id
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        texts = self.base[i]
+        if isinstance(texts, str):
+            texts = [texts]
+        parts = []
+        for text in texts:
+            ids = self.tokenizer.encode(text)
+            ids.append(self.eos_id)
+            parts.append(np.asarray(ids, dtype=np.int32))
+        tokens = np.concatenate(parts) if parts else np.empty(0, dtype=np.int32)
+        return len(texts), tokens
+
+
 class TokenStream:
 
     def __init__(self, dataset, tokenizer, seq_len, batch_size,
-                 shuffle_pool=SHUFFLE_POOL, skip_texts=0, seed=SEED):
+                 shuffle_pool=SHUFFLE_POOL, skip_items=0, seed=SEED):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.chunk_len = seq_len + 1
         self.batch_size = batch_size
         self.shuffle_pool = shuffle_pool
-        self.skip_texts = skip_texts
+        self.skip_items = skip_items
         self.rng = random.Random(seed)
         self.texts_consumed = 0
+        self.items_consumed = skip_items
 
-    def _texts(self):
+    def _token_arrays(self):
+        """Yields int32 token arrays, one per dataset item, in order."""
+        base = self.dataset
+        if self.skip_items:
+            # Resume the cheap way: never read, let alone tokenize, the items
+            # this run has already trained on.
+            base = Subset(base, range(self.skip_items, len(base)))
         loader = DataLoader(
-            self.dataset,
+            TokenizedItems(base, self.tokenizer, EOS_ID),
             batch_size=None,
             shuffle=False,
             num_workers=_NUM_WORKERS,
             pin_memory=False,
             persistent_workers=bool(_NUM_WORKERS),
-            prefetch_factor=4 if _NUM_WORKERS else None,
+            prefetch_factor=6 if _NUM_WORKERS else None,
+            collate_fn=_identity,
         )
-        for text_batch in loader:
-            texts = text_batch if isinstance(text_batch, (list, tuple)) else [text_batch]
-            for text in texts:
-                self.texts_consumed += 1
-                # Fast-forward on resume: skip without tokenizing or touching the GPU.
-                if self.texts_consumed <= self.skip_texts:
-                    continue
-                yield text
+        for n_texts, tokens in loader:
+            self.items_consumed += 1
+            self.texts_consumed += int(n_texts)
+            if tokens.size:
+                yield tokens
 
     def _sequences(self):
-        buffer = []
-        for text in self._texts():
-            buffer.extend(self.tokenizer.encode(text))
-            buffer.append(EOS_ID)
-            while len(buffer) >= self.chunk_len:
-                yield buffer[: self.chunk_len]
-                buffer = buffer[self.chunk_len:]
+        """Yields chunk_len-long int32 numpy rows of packed tokens.
+
+        The old version kept one Python list and did `buffer = buffer[chunk_len:]`
+        after every chunk -- an O(len(buffer)) list copy per sequence, on the
+        critical path. Here whole items arrive pre-encoded and are reshaped into
+        rows at a stroke, so packing costs one memcpy per token instead of one
+        per token per chunk.
+        """
+        chunk_len = self.chunk_len
+        buf = np.empty(0, dtype=np.int32)
+        for tokens in self._token_arrays():
+            buf = np.concatenate((buf, tokens)) if buf.size else tokens
+            n_full = buf.size // chunk_len
+            if not n_full:
+                continue
+            block = buf[: n_full * chunk_len].reshape(n_full, chunk_len)
+            for row in block:
+                yield row
+            buf = buf[n_full * chunk_len:].copy()
 
     def __iter__(self):
         pool, out = [], []
+        half = self.shuffle_pool // 2
+        bs = self.batch_size
         for seq in self._sequences():
             pool.append(seq)
             if len(pool) >= self.shuffle_pool:
                 self.rng.shuffle(pool)
-                out.extend(pool[self.shuffle_pool // 2:])
-                del pool[self.shuffle_pool // 2:]
-            while len(out) >= self.batch_size:
-                batch, out = out[: self.batch_size], out[self.batch_size:]
-                yield self._to_tensors(batch)
+                out.extend(pool[half:])
+                del pool[half:]
+            # `out` is drained front-to-back; pop a window instead of rebuilding
+            # the whole list on every batch.
+            i = 0
+            while len(out) - i >= bs:
+                yield self._to_tensors(out[i:i + bs])
+                i += bs
+            if i:
+                del out[:i]
         # drain
         self.rng.shuffle(pool)
         out.extend(pool)
-        while len(out) >= self.batch_size:
-            batch, out = out[: self.batch_size], out[self.batch_size:]
-            yield self._to_tensors(batch)
+        i = 0
+        while len(out) - i >= bs:
+            yield self._to_tensors(out[i:i + bs])
+            i += bs
 
     @staticmethod
     def _to_tensors(seqs):
-        block = torch.tensor(seqs, dtype=torch.long)
-        return block[:, :-1].contiguous(), block[:, 1:].contiguous()
+        """One numpy stack + one torch view, into pinned memory.
+
+        `torch.tensor(list_of_lists)` walked ~66k Python ints per micro-batch on
+        the critical path. Stacking numpy rows is a memcpy, and pinning lets the
+        H2D copy actually be async (a pageable copy is synchronous no matter what
+        non_blocking says).
+        """
+        block = torch.from_numpy(np.stack(seqs)).to(torch.long)
+        xs = block[:, :-1].contiguous()
+        ys = block[:, 1:].contiguous()
+        if _PIN_MEMORY:
+            xs, ys = xs.pin_memory(), ys.pin_memory()
+        return xs, ys
+
+
+class Prefetcher:
+    """Runs the CPU-side stream (parquet -> BPE -> pack -> pin) on a background
+    thread, and issues each H2D copy on a side CUDA stream from that same thread.
+
+    Two separate overlaps, both of which the original loop gave up:
+
+      * Tokenising is pure Python and holds the GIL, but every torch/CUDA call in
+        the training loop drops it, so the producer really does run during the
+        forward/backward rather than between steps.
+      * The copy for batch N+k is issued as soon as its bytes exist, on a stream
+        that is not the compute stream, and the compute stream only waits on the
+        matching event when it actually needs that batch. The old
+        `xs.to(DEVICE, non_blocking=True)` on the compute stream, from pageable
+        memory, was a plain synchronous copy sitting between two steps.
+    """
+
+    def __init__(self, stream, depth=4):
+        self.stream = stream
+        self.depth = depth
+        self.copy_stream = (torch.cuda.Stream(device=DEVICE)
+                            if DEVICE.type == "cuda" else None)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def close(self):
+        """Let the producer (and its DataLoader workers) shut down instead of
+        sitting blocked on a full queue after the loop breaks at MAX_STEPS."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+            self._thread = None
+
+    def _issue(self, xs, ys):
+        """Start the H2D copy; return device tensors plus an event to wait on."""
+        if self.copy_stream is None:
+            return xs.to(DEVICE), ys.to(DEVICE), None
+        with torch.cuda.stream(self.copy_stream):
+            xs = xs.to(DEVICE, non_blocking=True)
+            ys = ys.to(DEVICE, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(self.copy_stream)
+        return xs, ys, event
+
+    @staticmethod
+    def _consume(item):
+        xs, ys, event = item
+        if event is not None:
+            compute = torch.cuda.current_stream()
+            compute.wait_event(event)
+            # Allocated on copy_stream, used on compute: tell the allocator not
+            # to recycle the blocks until compute is done with them.
+            xs.record_stream(compute)
+            ys.record_stream(compute)
+        return xs, ys
+
+    def __iter__(self):
+        if not PREFETCH:
+            for xs, ys in self.stream:
+                yield self._consume(self._issue(xs, ys))
+            return
+
+        q = queue.Queue(maxsize=self.depth)
+        sentinel = object()
+        self._stop.clear()
+
+        def put(item):
+            while not self._stop.is_set():
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def producer():
+            try:
+                for xs, ys in self.stream:
+                    if not put(self._issue(xs, ys)):
+                        return
+            except Exception as e:                     # surface, don't hang
+                put(e)
+                return
+            put(sentinel)
+
+        self._thread = threading.Thread(target=producer, daemon=True,
+                                        name="tokenstream")
+        self._thread.start()
+        while True:
+            item = q.get()
+            if item is sentinel:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield self._consume(item)
 
 
 def build_validation_set():
     if os.path.exists(VAL_CACHE_FILE):
         blob = torch.load(VAL_CACHE_FILE, map_location="cpu")
-        logger.info(f"    loaded {len(blob['batches'])} cached validation batches")
-        return blob["batches"], int(blob["texts_consumed"])
+        cached = blob["batches"]
+        # A cache built at a different micro-batch size would make eval compile a
+        # second graph and change what "40 batches" means; rebuild instead.
+        if cached and tuple(cached[0][0].shape) != (MICRO_BATCH_SIZE, SEQ_LEN):
+            logger.warning(
+                f"    validation cache is {tuple(cached[0][0].shape)}, need "
+                f"{(MICRO_BATCH_SIZE, SEQ_LEN)}; rebuilding")
+        else:
+            logger.info(f"    loaded {len(cached)} cached validation batches")
+            return cached, int(blob.get("items_consumed", 0))
 
     logger.info(f"    building {VAL_BATCHES} validation batches (held out from training)...")
     stream = TokenStream(dataset, tokenizer, SEQ_LEN, MICRO_BATCH_SIZE,
@@ -225,9 +425,11 @@ def build_validation_set():
         batches.append((xs, ys))
         if len(batches) >= VAL_BATCHES:
             break
-    offset = stream.texts_consumed
-    atomic_save({"batches": batches, "texts_consumed": offset}, VAL_CACHE_FILE)
-    logger.info(f"    validation set uses the first {offset} texts of the stream")
+    offset = stream.items_consumed
+    atomic_save({"batches": batches, "items_consumed": offset,
+                 "texts_consumed": stream.texts_consumed}, VAL_CACHE_FILE)
+    logger.info(f"    validation set uses the first {offset} dataset items "
+                f"({stream.texts_consumed} texts) of the stream")
     return batches, offset
 
 
@@ -238,7 +440,16 @@ base_model = Transformer(
     n_head=NUM_HEADS,
     n_dim=EMBEDDING_DIM,
     n_seq=SEQ_LEN,
+    activation_checkpointing=False,
+    loss_chunk_size=LOSS_CHUNK_SIZE,
 ).to(DEVICE)
+logger.info(f"    n_head={NUM_HEADS} -> head_dim={EMBEDDING_DIM // NUM_HEADS} "
+            f"| kv heads={base_model.n_kv_head} | loss chunk={LOSS_CHUNK_SIZE}")
+# channels_last is meaningless for a transformer, but making every parameter
+# contiguous once avoids per-step relayout inside the fused kernels.
+for _p in base_model.parameters():
+    if not _p.is_contiguous():
+        _p.data = _p.data.contiguous()
 
 param_count = base_model.get_param_count()
 tokens_per_step = MICRO_BATCH_SIZE * SEQ_LEN * GRAD_ACCUM_STEPS
@@ -279,12 +490,24 @@ if APPLY_RESIDUAL_INIT_SCALING:
 train_model = base_model
 if USE_COMPILE:
     try:
-        train_model = torch.compile(base_model)
-        logger.info("    torch.compile enabled")
+        # compile() is lazy, so a failure surfaces on the first step, long past
+        # this try/except. suppress_errors turns that into a per-graph eager
+        # fallback (logged) instead of killing a multi-hour run.
+        torch._dynamo.config.suppress_errors = True
+        torch._dynamo.config.cache_size_limit = 32
+        # Compile calculate_loss, not the module: it is the whole training-step
+        # graph (blocks + chunked logit projection + CE), so inductor gets to
+        # fuse the norms, SwiGLU and the loss reduction instead of just the
+        # blocks. Shapes are fixed by MICRO_BATCH_SIZE x SEQ_LEN, so one graph
+        # is compiled and reused for the entire run.
+        base_model.calculate_loss = torch.compile(
+            base_model.calculate_loss, mode=COMPILE_MODE, dynamic=False)
+        logger.info(f"    torch.compile enabled (mode={COMPILE_MODE}); "
+                    f"first step pays a one-off ~1-3 min warmup")
     except Exception as e:
         logger.warning(f"    torch.compile failed, running eager: {e}")
 else:
-    logger.info("    eager mode (set USE_COMPILE=1 on Linux for ~1.3-1.8x)")
+    logger.info("    eager mode (USE_COMPILE=1 for ~1.3-1.8x)")
 
 
 decay_params, nodecay_params = [], []
@@ -385,8 +608,8 @@ def evaluate(val_batches):
     train_model.eval()
     total = torch.zeros((), device=DEVICE)
     for xs, ys in val_batches:
-        xs = xs.to(DEVICE, non_blocking=True)
-        ys = ys.to(DEVICE, non_blocking=True)
+        # val_batches already live on the device -- 40 micro-batches is ~40 MB,
+        # and re-uploading them every 500 steps was pure stall.
         with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE,
                             enabled=DEVICE.type == "cuda"):
             total += train_model.calculate_loss(xs, ys).detach()
@@ -407,10 +630,13 @@ def log_sample_generation(step):
     base_model.train()
 
 
-def save_checkpoint(path, step, texts_consumed, last_val):
+def save_checkpoint(path, step, stream, last_val):
     ck = {
         "global_step": step,
-        "texts_consumed": texts_consumed,
+        # Item index, not text count: resuming can then skip straight past the
+        # consumed part of the dataset instead of re-tokenizing it.
+        "items_consumed": stream.items_consumed,
+        "texts_consumed": stream.texts_consumed,
         "model_state_dict": base_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "history": history,
@@ -429,12 +655,49 @@ def save_checkpoint(path, step, texts_consumed, last_val):
 
 
 global_step = 0
-texts_consumed_at_ckpt = 0
+items_consumed_at_ckpt = 0
 last_val_loss = float("nan")
+
+
+class _FreshStart(Exception):
+    """Not an error: the checkpoint is for a different architecture, so it is
+    set aside and this run starts from scratch."""
+
 
 if os.path.exists(CHECKPOINT_FILE):
     try:
         ck = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
+        old_cfg = ck.get("config") or {}
+        new_cfg = {"vocab_size": MODEL_VOCAB_SIZE, "n_layer": NUM_LAYERS,
+                   "n_head": NUM_HEADS, "n_dim": EMBEDDING_DIM, "n_seq": SEQ_LEN}
+        mismatch = {k: (v, new_cfg[k]) for k, v in old_cfg.items()
+                    if k in new_cfg and v != new_cfg[k]}
+
+        # The config dict is only a label -- check the tensors themselves, so a
+        # difference it does not record (vocab padding, kv-head count, a checkpoint
+        # with no config at all) is caught too. load_state_dict copies as it goes
+        # and reports shape errors at the end, which would otherwise leave a model
+        # half-loaded and half-random.
+        want = base_model.state_dict()
+        have = ck["model_state_dict"]
+        shape_diff = [k for k in want
+                      if k not in have or tuple(have[k].shape) != tuple(want[k].shape)]
+        if shape_diff and not mismatch:
+            mismatch = {"tensors": (f"{len(shape_diff)} differ, e.g. {shape_diff[0]}",
+                                    "new shapes")}
+
+        if mismatch or shape_diff:
+            # New architecture: the model built above already has it, so just
+            # train it from step 0. The old checkpoint is moved aside rather than
+            # deleted -- it is the only copy of that run, and the next CKPT_EVERY
+            # would otherwise overwrite it a few minutes from now.
+            stale = f"{CHECKPOINT_FILE}.{'-'.join(sorted(mismatch))}-{RUN_ID}.bak"
+            os.replace(CHECKPOINT_FILE, stale)
+            logger.warning(
+                f"Checkpoint architecture differs from this config "
+                f"(old -> new: {mismatch}); starting a fresh run at step 0 with "
+                f"the new architecture. Previous checkpoint kept at {stale}")
+            raise _FreshStart
         base_model.load_state_dict(ck["model_state_dict"])
         try:
             optimizer.load_state_dict(ck["optimizer_state_dict"])
@@ -446,30 +709,47 @@ if os.path.exists(CHECKPOINT_FILE):
             except Exception:
                 logger.warning("Scaler state did not load; continuing")
         global_step = int(ck.get("global_step", 0))
-        texts_consumed_at_ckpt = int(ck.get("texts_consumed", 0))
+        if "items_consumed" in ck:
+            items_consumed_at_ckpt = int(ck["items_consumed"])
+        elif ck.get("texts_consumed"):
+            # Pre-item-index checkpoint. Dataset items hold DATASET_BATCH_SIZE
+            # texts before chunking, so this is an estimate; it only shifts where
+            # in the corpus the resumed run picks up.
+            items_consumed_at_ckpt = int(ck["texts_consumed"]) // DATASET_BATCH_SIZE
+            logger.warning("Old checkpoint format: data position estimated from "
+                           f"texts_consumed -> item {items_consumed_at_ckpt}")
         if isinstance(ck.get("history"), dict):
             history.update({k: v for k, v in ck["history"].items() if k in history})
             history["run_id"] = RUN_ID
         last_val_loss = float(ck.get("val_loss", float("nan")))
-        logger.info(f"Resumed: step={global_step}, texts_consumed={texts_consumed_at_ckpt}")
+        logger.info(f"Resumed: step={global_step}, items_consumed={items_consumed_at_ckpt}")
+    except _FreshStart:
+        pass                       # already logged; model is new-architecture
     except Exception as e:
         logger.warning(f"Failed to load checkpoint {CHECKPOINT_FILE}: {e}")
 
 
-val_batches, val_text_offset = build_validation_set()
+val_batches, val_item_offset = build_validation_set()
+val_batches = [(xs.to(DEVICE, non_blocking=True), ys.to(DEVICE, non_blocking=True))
+               for xs, ys in val_batches]
 
 logger.info("[4] Training...")
 stream = TokenStream(
     dataset, tokenizer, SEQ_LEN, MICRO_BATCH_SIZE,
-    skip_texts=max(val_text_offset, texts_consumed_at_ckpt),
+    skip_items=max(val_item_offset, items_consumed_at_ckpt),
     seed=SEED + global_step,
 )
-if texts_consumed_at_ckpt > val_text_offset:
-    logger.info(f"    fast-forwarding data stream past {texts_consumed_at_ckpt} texts "
-                f"(no forward/backward on skipped data)")
+batches = Prefetcher(stream)
+if items_consumed_at_ckpt > val_item_offset:
+    logger.info(f"    resuming at dataset item {items_consumed_at_ckpt} "
+                f"(skipped items are never read or tokenized)")
 
 train_model.train()
 optimizer.zero_grad(set_to_none=True)
+
+# Cached once: rebuilding this generator inside clip_grad_norm_ every step walks
+# the whole module tree in Python.
+all_params = [p for p in base_model.parameters() if p.requires_grad]
 
 training_start = time.time()
 accum_loss = torch.zeros((), device=DEVICE)
@@ -477,14 +757,49 @@ accum_micro = 0
 skipped_steps = 0
 step_timer = time.time()
 
+# Per-step metrics are staged on the GPU and read back in one transfer every
+# LOG_EVERY steps. Reading loss/grad_norm every step drains the pipeline and
+# kills CPU run-ahead -- the CPU can no longer queue step N+1's kernels while
+# the GPU chews on step N, which on a fast card is most of the step time.
+_pending = []          # list of (step, lr, tok_per_sec, device_tensor[loss, gn, finite])
+
+
+def flush_metrics(pbar=None):
+    global skipped_steps
+    if not _pending:
+        return
+    packed = torch.stack([t for *_, t in _pending]).cpu()      # ONE sync
+    last = None
+    for (step, lr_v, tps, _), row in zip(_pending, packed):
+        step_loss, gn, finite = float(row[0]), float(row[1]), float(row[2])
+        history["steps"].append(step)
+        history["train_loss"].append(step_loss)
+        history["lr"].append(lr_v)
+        history["grad_norm"].append(gn)
+        history["tokens_per_sec"].append(tps)
+        if finite < 0.5:
+            skipped_steps += 1
+            logger.warning(f"    non-finite grad norm at step {step}; grads zeroed "
+                           f"({skipped_steps} total)")
+        last = (step, step_loss, lr_v, gn, tps)
+    _pending.clear()
+    if pbar is not None and last is not None:
+        step, step_loss, lr_v, gn, tps = last
+        pbar.set_postfix({
+            "loss": f"{step_loss:.4f}",
+            "ppl": f"{math.exp(min(20, step_loss)):.1f}",
+            "lr": f"{lr_v:.2e}",
+            "gn": f"{gn:.2f}",
+            "tok/s": f"{tps/1e3:.1f}k",
+        })
+    return last
+
+
 pbar = tqdm(total=MAX_STEPS, initial=global_step, desc="pretrain", unit="step")
 
-for xs, ys in stream:
+for xs, ys in batches:
     if global_step >= MAX_STEPS:
         break
-
-    xs = xs.to(DEVICE, non_blocking=True)
-    ys = ys.to(DEVICE, non_blocking=True)
 
     with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE,
                         enabled=DEVICE.type == "cuda"):
@@ -509,53 +824,53 @@ for xs, ys in stream:
 
     if scaler is not None:
         scaler.unscale_(optimizer)
-    grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), GRAD_CLIP_NORM)
 
-    if torch.isfinite(grad_norm):
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
+    # Hand-rolled clip so the "skip non-finite steps" guard is free. The old
+    # `if torch.isfinite(grad_norm):` was a blocking host sync on the critical
+    # path of every step, and clip_grad_norm_ would then have made a second
+    # full read/write pass over all 110M grads. Here the finite check folds
+    # into the clip coefficient: non-finite -> scale 0 -> the update is a no-op,
+    # and the CPU never waits to find out.
+    grads = [p.grad for p in all_params if p.grad is not None]
+    grad_norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads)))
+    finite = torch.isfinite(grad_norm)
+    scale = torch.where(
+        finite, (GRAD_CLIP_NORM / (grad_norm + 1e-6)).clamp(max=1.0),
+        grad_norm.new_zeros(()))
+    torch._foreach_mul_(grads, scale)
+
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
     else:
-        skipped_steps += 1
-        if scaler is not None:
-            scaler.update()
-        logger.warning(f"    non-finite grad norm at step {global_step}; step skipped "
-                       f"({skipped_steps} total)")
+        optimizer.step()
 
     optimizer.zero_grad(set_to_none=True)
 
-    step_loss = accum_loss.item()          # one sync per optimizer step
-    accum_loss.zero_()
+    step_metrics = torch.stack((
+        accum_loss.detach().float(),
+        grad_norm.detach().float(),
+        finite.float(),
+    ))
+    accum_loss.zero_()          # torch.stack above already copied the value
     accum_micro = 0
     global_step += 1
 
     step_time = time.time() - step_timer
     step_timer = time.time()
     tok_per_sec = tokens_per_step / max(1e-6, step_time)
-
-    history["steps"].append(global_step)
-    history["train_loss"].append(step_loss)
-    history["lr"].append(lr)
-    history["grad_norm"].append(float(grad_norm))
-    history["tokens_per_sec"].append(tok_per_sec)
+    _pending.append((global_step, lr, tok_per_sec, step_metrics))
 
     pbar.update(1)
-    pbar.set_postfix({
-        "loss": f"{step_loss:.4f}",
-        "ppl": f"{math.exp(min(20, step_loss)):.1f}",
-        "lr": f"{lr:.2e}",
-        "gn": f"{float(grad_norm):.2f}",
-        "tok/s": f"{tok_per_sec/1e3:.1f}k",
-    })
 
     if global_step % LOG_EVERY == 0:
+        last = flush_metrics(pbar)
         recent = history["train_loss"][-LOG_EVERY:]
-        logger.info(
-            f"    step {global_step}/{MAX_STEPS} | loss {sum(recent)/len(recent):.4f} "
-            f"| lr {lr:.2e} | gn {float(grad_norm):.2f} | {tok_per_sec/1e3:.1f}k tok/s"
-        )
+        if last:
+            logger.info(
+                f"    step {global_step}/{MAX_STEPS} | loss {sum(recent)/len(recent):.4f} "
+                f"| lr {lr:.2e} | gn {last[3]:.2f} | {tok_per_sec/1e3:.1f}k tok/s"
+            )
 
     if global_step % EVAL_EVERY == 0:
         last_val_loss = evaluate(val_batches)
@@ -567,20 +882,26 @@ for xs, ys in stream:
     if global_step % SAMPLE_EVERY == 0:
         log_sample_generation(global_step)
 
+    # Plotting and checkpointing both read `history`, so drain the staged
+    # metrics first; they are rare enough that the extra sync costs nothing.
     if global_step % PLOT_EVERY == 0:
+        flush_metrics(pbar)
         save_plots()
         save_metrics()
 
     if global_step % CKPT_EVERY == 0:
-        save_checkpoint(CHECKPOINT_FILE, global_step, stream.texts_consumed, last_val_loss)
+        flush_metrics(pbar)
+        save_checkpoint(CHECKPOINT_FILE, global_step, stream, last_val_loss)
         logger.info(f"    checkpoint saved at step {global_step}")
 
     if global_step % SNAPSHOT_EVERY == 0:
         snap = f"{ARTIFACTS_DIR}/pretrain_step{global_step}.pt"
-        save_checkpoint(snap, global_step, stream.texts_consumed, last_val_loss)
+        save_checkpoint(snap, global_step, stream, last_val_loss)
         logger.info(f"    snapshot -> {snap}")
 
 pbar.close()
+batches.close()
+flush_metrics()
 
 # Drop any partial accumulation: those grads are a fraction of a step and, with
 # a scaler, were never unscaled. Not worth a wrong final update.
@@ -592,7 +913,7 @@ history["val_steps"].append(global_step)
 history["val_loss"].append(last_val_loss)
 logger.info(f"Final val loss {last_val_loss:.4f} | ppl {math.exp(min(20, last_val_loss)):.2f}")
 
-save_checkpoint(CHECKPOINT_FILE, global_step, stream.texts_consumed, last_val_loss)
+save_checkpoint(CHECKPOINT_FILE, global_step, stream, last_val_loss)
 atomic_save(base_model.state_dict(), TRAINED_MODEL_FILE)
 save_plots()
 save_metrics()
