@@ -14,8 +14,24 @@ MAXIMUM_CHUNK_SIZE = 3 * 1024
 MAX_CORPUS_SIZE = 200 * 1024 ** 2
 
 _pretrain_dataset_folders = sorted(os.listdir(RAW_DATASET_FOLDER))
-_pret_data_cached_file = None
-_pret_data_cached_df = None
+
+# Small LRU of parquet dataframes. The stream now interleaves the sources
+# (cosmopedia / fineweb / fineweb-edu), so at any moment one file per source is
+# hot instead of one file total. Each source is still walked in row order, so
+# this only needs to hold the ~3 currently-active files.
+_DF_CACHE_MAX = int(os.environ.get("PRETRAIN_DF_CACHE", "4"))
+_df_cache = {}
+
+
+def _get_df(filepath, cols):
+    df = _df_cache.pop(filepath, None)
+    if df is None:
+        df = pd.read_parquet(filepath, columns=cols)
+    _df_cache[filepath] = df                      # move/insert as most-recent
+    while len(_df_cache) > _DF_CACHE_MAX:
+        _df_cache.pop(next(iter(_df_cache)))      # evict least-recently-used
+    return df
+
 
 _all_files = []
 for folder in _pretrain_dataset_folders:
@@ -45,20 +61,15 @@ def load_processed_chunks(
         n=10,
         min_chunk_size=MINIMUM_CHUNK_SIZE,
         max_chunk_size=MAXIMUM_CHUNK_SIZE, dataset_folder=None):
-    global _pret_data_cached_file, _pret_data_cached_df
-    
+
     # Fallback to original logic if a specific dataset_folder is requested
     if dataset_folder is not None:
         files = sorted(os.path.join(RAW_DATASET_FOLDER, dataset_folder, f) for f in os.listdir(os.path.join(RAW_DATASET_FOLDER, dataset_folder)) if f.endswith(".parquet"))
         start, end = index * n, index * n + n
         for filepath in files:
             omit_language_check = any(pattern in filepath for pattern in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
-            if _pret_data_cached_file == filepath:
-                df = _pret_data_cached_df
-            else:
-                cols_to_read = ["text"] if omit_language_check else ["text", "language"]
-                df = pd.read_parquet(filepath, columns=cols_to_read)
-                _pret_data_cached_file, _pret_data_cached_df = filepath, df
+            cols_to_read = ["text"] if omit_language_check else ["text", "language"]
+            df = _get_df(filepath, cols_to_read)
 
             if start >= (df_len := len(df)):
                 start -= df_len
@@ -111,13 +122,9 @@ def load_processed_chunks(
     
     omit_language_check = any(pattern in filepath for pattern in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
     cols_to_read = ["text"] if omit_language_check else ["text", "language"]
-    
-    if _pret_data_cached_file == filepath:
-        df = _pret_data_cached_df
-    else:
-        df = pd.read_parquet(filepath, columns=cols_to_read)
-        _pret_data_cached_file, _pret_data_cached_df = filepath, df
-        
+
+    df = _get_df(filepath, cols_to_read)
+
     if local_start >= len(df):
         return []
         
@@ -195,6 +202,58 @@ def load_prcessed_wikipedia_chunks(chunk_size=MINIMUM_CHUNK_SIZE):
     return chunks
 
 
+def _folder_row_bounds():
+    """[(folder, cumulative_row_end), ...] over _all_files, in file order."""
+    bounds, cum, cur = [], 0, None
+    for filepath, rows in _file_metadata:
+        folder = os.path.basename(os.path.dirname(filepath))
+        if cur is not None and folder != cur:
+            bounds.append((cur, cum))
+        cur, cum = folder, cum + rows
+    if cur is not None:
+        bounds.append((cur, cum))
+    return bounds
+
+
+def _interleave_order(n_pretrain_batches, n_wiki_batches, batch_size):
+    """Permutation of range(n_pretrain_batches + n_wiki_batches) that rotates
+    through the sources (cosmopedia / fineweb / fineweb-edu / wikipedia) instead
+    of running each one to exhaustion before the next -- which is what made the
+    loss collapse partway through pretraining when the stream crossed from one
+    source into the next.
+
+    Blocks stay in ascending order *within* each source, so every source is
+    still read sequentially from its parquet files (no random-access cost), and
+    the schedule is proportional to size so all sources finish together.
+    """
+    groups, prev = [], 0
+    for _folder, row_end in _folder_row_bounds():
+        end = min(n_pretrain_batches, math.ceil(row_end / batch_size))
+        if end > prev:
+            groups.append(list(range(prev, end)))
+        prev = end
+    if n_wiki_batches:
+        groups.append(list(range(n_pretrain_batches,
+                                 n_pretrain_batches + n_wiki_batches)))
+
+    if len(groups) <= 1:
+        return [i for g in groups for i in g]
+
+    weights = [len(g) for g in groups]
+    total = sum(weights)
+    cursors = [0] * len(groups)
+    order = []
+    for _ in range(total):
+        # virtual-time / stride scheduling: serve whichever source has taken the
+        # smallest fraction of its blocks so far. Keeps every source's density
+        # constant across the whole permutation, so they all finish together.
+        j = min((k for k in range(len(groups)) if cursors[k] < len(groups[k])),
+                key=lambda k: (cursors[k] + 0.5) / weights[k])
+        order.append(groups[j][cursors[j]])
+        cursors[j] += 1
+    return order
+
+
 class PretrainTextDataset(Dataset):
     def __init__(self, batch_size=10, min_chunk_size=MINIMUM_CHUNK_SIZE,
                  max_chunk_size=MAXIMUM_CHUNK_SIZE, dataset_folder=None,
@@ -215,6 +274,10 @@ class PretrainTextDataset(Dataset):
         self.wiki_chunks = load_prcessed_wikipedia_chunks(wikipedia_chunk_size) if include_wikipedia else []
         self._num_wiki_batches = math.ceil(len(self.wiki_chunks) / batch_size) if self.wiki_chunks else 0
 
+        # Rotate through the sources instead of serving them in blocks.
+        self._order = _interleave_order(
+            self._num_pretrain_batches, self._num_wiki_batches, batch_size)
+
     def __len__(self):
         return self._num_pretrain_batches + self._num_wiki_batches
 
@@ -223,6 +286,8 @@ class PretrainTextDataset(Dataset):
             idx += len(self)
         if idx < 0 or idx >= len(self):
             raise IndexError(idx)
+
+        idx = self._order[idx]
 
         if idx < self._num_pretrain_batches:
             return load_processed_chunks(
