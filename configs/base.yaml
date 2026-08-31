@@ -1,0 +1,58 @@
+# Reference run: ~186M parameters, 6.3B tokens (~34 tok/param).
+#
+# Sized for one 80GB A100 at micro_batch 16 x 2048 ctx. On smaller cards drop
+# micro_batch_size and raise grad_accum_steps by the same factor -- the global
+# batch, and therefore the loss curve, is unchanged.
+
+model:
+  vocab_size: 32768
+  n_dim: 896
+  n_layer: 18
+  n_head: 14          # head_dim = 64, the size the flash kernels are tuned for
+  n_kv_head: 2        # GQA, 7 query heads per KV head (Qwen2-0.5B geometry)
+  n_seq: 2048
+  rope_theta: 10000.0
+  dropout: 0.0
+  tie_embeddings: true
+  init_std: 0.02
+  z_loss_weight: 1.0e-4
+  loss_chunk_size: 512
+  activation_checkpointing: false
+
+data:
+  data_dir: dataset/tokens
+  tokenizer_file: artifacts/tokenizer-32768.txt
+  raw_dir: dataset/raw
+  val_shards: 1
+  val_batches: 40
+  seed: 1337
+
+optim:
+  micro_batch_size: 16
+  grad_accum_steps: 8       # global batch 128 seqs = 262k tokens/step
+  max_steps: 24000
+  peak_lr: 5.0e-4
+  min_lr_ratio: 0.1
+  warmup_frac: 0.02
+  schedule: cosine
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+
+runtime:
+  out_dir: artifacts
+  log_dir: logs
+  compile: true
+  compile_mode: default
+  dtype: bfloat16
+  log_every: 50
+  eval_every: 500
+  sample_every: 1000
+  ckpt_every: 500
+  snapshot_every: 5000
+  plot_every: 200
+  tensorboard: false
+  wandb: false
+  seed: 1337
+  resume: auto

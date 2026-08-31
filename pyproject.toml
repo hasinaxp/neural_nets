@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanollm"
+version = "0.1.0"
+description = "A ~186M parameter decoder-only LLM training stack for a single GPU or a small node"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "regex>=2023.10",
+    "pyarrow>=14.0",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+data = ["huggingface_hub>=0.23", "datasets>=2.18"]
+viz = ["matplotlib>=3.7"]
+track = ["tensorboard>=2.15", "wandb>=0.16"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.2", "ruff>=0.4"]
+all = ["nanollm[data,viz,track,dev]"]
+
+[project.scripts]
+nanollm-pretrain = "nanollm.train.pretrain:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --timeout=300"
+filterwarnings = ["ignore::UserWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]

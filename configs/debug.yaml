@@ -1,0 +1,30 @@
+# Tiny, fast config for smoke tests: ~7M params, a couple of minutes on CPU.
+model:
+  vocab_size: 32768
+  n_dim: 256
+  n_layer: 4
+  n_head: 4
+  n_kv_head: 2
+  n_seq: 256
+  loss_chunk_size: 128
+
+data:
+  data_dir: dataset/tokens
+  tokenizer_file: artifacts/tokenizer-32768.txt
+  val_shards: 1
+  val_batches: 4
+
+optim:
+  micro_batch_size: 4
+  grad_accum_steps: 2
+  max_steps: 50
+  peak_lr: 3.0e-4
+  warmup_frac: 0.1
+
+runtime:
+  compile: false
+  log_every: 10
+  eval_every: 25
+  sample_every: 25
+  ckpt_every: 50
+  plot_every: 25

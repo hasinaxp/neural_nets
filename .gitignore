@@ -1,10 +1,28 @@
+# Python
 __pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Data: corpora and tokenized shards are large and reproducible
 dataset/*
-artifacts/*
 !dataset/sample.txt
 !dataset/wikipedia.txt.gz
+
+# Artifacts: checkpoints are large; tokenizers are small and worth keeping
+artifacts/*
+!artifacts/tokenizer-*.txt
 transformer_model.pt
-!artifacts/tokenizer-20000.txt
-!artifacts/tokenizer-32768.txt
-logs/train_2*
-logs/sft_2*
+*.pt
+*.pt.tmp
+*.bak
+
+# Logs and run outputs
+logs/*
+!logs/.gitkeep
+wandb/
+runs/

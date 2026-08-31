@@ -1,0 +1,23 @@
+# Core training stack. Install torch first, matched to your CUDA version:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.4
+numpy>=1.24
+pyyaml>=6.0
+tqdm>=4.66
+regex>=2023.10
+
+# Corpus preparation (parquet reading + HF downloads)
+pyarrow>=14.0
+pandas>=2.0
+huggingface_hub>=0.23
+
+# Plots and telemetry (optional but on by default in configs/base.yaml)
+matplotlib>=3.7
+
+# Optional trackers -- enable with runtime.tensorboard / runtime.wandb
+# tensorboard>=2.15
+# wandb>=0.16
+
+# Tests
+pytest>=7.4
+pytest-timeout>=2.2

@@ -16,6 +16,17 @@ model "currently believes" the next token is at that depth.
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+# This file lives in tools/; put the repo root and src/ on the path so the
+# legacy shims (config, simple_transformer, ...) and nanollm both resolve.
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+for _p in (_ROOT, _os.path.join(_ROOT, "src")):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+
+
 import argparse
 import math
 import os
