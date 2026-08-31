@@ -65,8 +65,29 @@ download_data.py  →  train_tokenizer.py  →  prepare_data.py  →  train.pret
 python -m nanollm.train.sft --config configs/base.yaml    # instruction tuning
 python -m nanollm.train.dpo --config configs/base.yaml    # preference tuning
 python scripts/evaluate.py --checkpoint artifacts/dpo_model.pt
-python scripts/generate.py --prompt "The history of" --tokens 200
+python scripts/generate.py --prompt "The history of" --tokens 200   # base model
+python scripts/chat.py                                              # chat model
 ```
+
+### Chatting with the tuned model
+
+`scripts/chat.py` picks the most post-trained checkpoint it can find
+(`dpo_model.pt` → `sft_model.pt`) and streams replies token by token, reusing a
+KV cache across the turn. It builds prompts with the exact template SFT trained
+on — `<|BOS|> <|USER|> … <|ASSISTANT|> … <|EOS|>` — and stops at `<|EOS|>`,
+which SFT explicitly trains the model to emit.
+
+```bash
+python scripts/chat.py                                   # interactive
+python scripts/chat.py --prompt "Explain gravity." --once
+python scripts/chat.py --checkpoint artifacts/sft_model.pt --temperature 0.6
+```
+
+In-session commands: `/reset`, `/retry`, `/undo`, `/history`, `/tokens`,
+`/params`, `/set temperature=0.3`, `/help`, `/exit`.
+
+When history outgrows the 2048-token context the **oldest** turns are dropped —
+the current question is the part that has to survive intact.
 
 ## Why pre-tokenized shards
 

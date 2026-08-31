@@ -1,4 +1,4 @@
-.PHONY: help install data tokenizer shards pretrain sft dpo eval sample test lint clean
+.PHONY: help install data tokenizer shards pretrain sft dpo eval sample chat smoke test lint clean
 
 PY      ?= python
 CONFIG  ?= configs/base.yaml
@@ -35,8 +35,11 @@ dpo:  ## preference tuning
 eval:  ## evaluate the latest checkpoint
 	$(PY) scripts/evaluate.py --config $(CONFIG)
 
-sample:  ## generate from the latest checkpoint
+sample:  ## generate from the latest checkpoint (base model)
 	$(PY) scripts/generate.py --config $(CONFIG)
+
+chat:  ## interactive chat with the DPO (or SFT) model
+	$(PY) scripts/chat.py
 
 smoke:  ## end-to-end run on the debug config
 	$(PY) -m nanollm.train.pretrain --config configs/debug.yaml --dry-run
