@@ -89,11 +89,16 @@ class MetricLogger:
                 self._log.warning(f"wandb disabled: {e}")
 
     def log(self, step: int, **values) -> None:
+        """Record extra per-step scalars (anything beyond the fixed KEYS).
+
+        Unknown keys create their own history list on first use, so a stage can
+        track its own diagnostics -- DPO's reward_margin / reward_accuracy, say --
+        and have them land in metrics.json alongside the standard series.
+        """
         if not self.enabled:
             return
         for key, value in values.items():
-            if key in self.history:
-                self.history[key].append(value)
+            self.history.setdefault(key, []).append(value)
             if self.tb is not None:
                 self.tb.add_scalar(key, value, step)
         if self.wandb is not None:

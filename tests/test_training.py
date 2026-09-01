@@ -141,3 +141,19 @@ def test_sequence_logprobs_ignore_masked_positions():
     all_masked = torch.full_like(xs, IGNORE_INDEX)
     with torch.no_grad():
         assert sequence_logprobs(model, xs, all_masked).item() == 0.0
+
+
+def test_sequence_logprobs_length_normalization():
+    torch.manual_seed(0)
+    model = Transformer(vocab_size=64, n_dim=32, n_layer=1, n_head=2,
+                        n_kv_head=1, n_seq=32, loss_chunk_size=4).eval()
+    xs = torch.randint(0, 64, (2, 8))
+    ys = xs.clone()
+    ys[:, :4] = IGNORE_INDEX                       # 4 scored tokens per row
+    with torch.no_grad():
+        summed = sequence_logprobs(model, xs, ys, length_normalize=False)
+        mean = sequence_logprobs(model, xs, ys, length_normalize=True)
+    assert torch.allclose(mean, summed / 4)
+    # length-normalised is the default
+    with torch.no_grad():
+        assert torch.allclose(sequence_logprobs(model, xs, ys), mean)

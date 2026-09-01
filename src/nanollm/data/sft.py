@@ -8,6 +8,8 @@ import pandas as pd
 import pyarrow.parquet as pq
 from torch.utils.data import Dataset
 
+from .sources import strip_foreign_scripts
+
 SFT_DATASET_FOLDER = "dataset/sft"
 MANIFEST_FILE = f"{SFT_DATASET_FOLDER}/manifest.json"
 CACHE_FOLDER = f"{SFT_DATASET_FOLDER}/cache"
@@ -78,7 +80,10 @@ REASONING_PROMPTS = [
 def _clean(text):
     if not isinstance(text, str):
         return ""
-    return text.encode("ascii", errors="ignore").decode("ascii").strip()
+    # Drop letters from non-Latin scripts but keep punctuation, symbols and
+    # accents -- curly quotes, em-dashes and the like carry meaning and were
+    # being silently deleted by the old encode("ascii") pass.
+    return strip_foreign_scripts(text).strip()
 
 
 def _as_list(seq):

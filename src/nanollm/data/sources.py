@@ -9,17 +9,22 @@ from __future__ import annotations
 import gzip
 import math
 import os
+import unicodedata
 from typing import Iterator, Optional
 
 RAW_DATASET_FOLDER = "dataset/raw"
 OMIT_LANGUAGE_CHECK_FILEPATTERNS = ["cosmopedia"]
 
 MINIMUM_CHUNK_SIZE = 1024
-MAXIMUM_CHUNK_SIZE = 3 * 1024
+# A chunk is the longest span the model will ever see as one coherent context.
+# At 3 * 1024 chars (~750 tokens) every training sequence at n_seq=2048 was three
+# unrelated chunks concatenated, so long-form generation had nothing to imitate.
+# 12 * 1024 chars (~3k tokens) fills most of the context with a single document.
+MAXIMUM_CHUNK_SIZE = 12 * 1024
 
 __all__ = [
     "list_parquet_files", "iter_parquet_documents", "iter_wikipedia_documents",
-    "iter_all_documents", "split_long_text", "source_of",
+    "iter_all_documents", "split_long_text", "strip_foreign_scripts", "source_of",
 ]
 
 
@@ -43,6 +48,32 @@ def source_of(filepath: str) -> str:
     return os.path.basename(os.path.dirname(filepath))
 
 
+# Non-Latin letters are dropped a character at a time: the corpus is filtered to
+# English upstream (the ``language == "en"`` check in iter_parquet_documents), so
+# anything in another script here is a stray quote, name, or loan word, and the
+# tokenizer has no budget for it. Punctuation, symbols, currency, arrows and
+# maths operators are all kept -- curly quotes, em-dashes, +/-, and so on carry
+# meaning and were being silently deleted by the old ``encode("ascii")`` pass.
+def _is_foreign_letter(ch: str) -> bool:
+    if ch.isascii():
+        return False
+    if not unicodedata.category(ch).startswith("L"):
+        return False   # keep every non-letter: punctuation, symbols, maths
+    # Latin blocks: Basic/Latin-1, Extended-A/B/C/D, Extended Additional, IPA.
+    cp = ord(ch)
+    latin = (cp <= 0x024F or 0x1E00 <= cp <= 0x1EFF
+             or 0x0250 <= cp <= 0x02AF or 0x2C60 <= cp <= 0x2C7F
+             or 0xA720 <= cp <= 0xA7FF)
+    return not latin
+
+
+def strip_foreign_scripts(text: str) -> str:
+    """Drop letters from non-Latin scripts; keep all punctuation and symbols."""
+    if text.isascii():
+        return text
+    return "".join(ch for ch in text if not _is_foreign_letter(ch))
+
+
 def split_long_text(text: str,
                     min_chunk_size: int = MINIMUM_CHUNK_SIZE,
                     max_chunk_size: int = MAXIMUM_CHUNK_SIZE) -> list[str]:
@@ -51,7 +82,7 @@ def split_long_text(text: str,
     Documents shorter than ``min_chunk_size`` are dropped: they are mostly
     boilerplate and navigation chrome in web crawl data.
     """
-    text = text.encode("ascii", errors="ignore").decode("ascii")
+    text = strip_foreign_scripts(text)
     if len(text) <= min_chunk_size:
         return []
     if len(text) <= max_chunk_size:
@@ -108,10 +139,15 @@ def iter_parquet_documents(
 
 def iter_wikipedia_documents(
     path: str = "dataset/wikipedia.txt.gz",
-    chunk_size: int = MINIMUM_CHUNK_SIZE,
-    max_chunk_size: int = 4 * 1024,
+    chunk_size: int = MAXIMUM_CHUNK_SIZE,
+    max_chunk_size: int = MAXIMUM_CHUNK_SIZE + 1024,
 ) -> Iterator[str]:
-    """Stream the bundled wikipedia dump line by line."""
+    """Stream the bundled wikipedia dump line by line.
+
+    ``chunk_size`` is the target span accumulated before a chunk is emitted; it
+    tracks ``MAXIMUM_CHUNK_SIZE`` for the same reason -- shorter spans leave the
+    model without a coherent long-form example to learn from.
+    """
     if not os.path.exists(path):
         alt = path.replace(".txt.gz", ".zip")
         if not os.path.exists(alt):
@@ -175,7 +211,7 @@ def iter_all_documents(
     if include_wikipedia and os.path.exists(wikipedia_path):
         streams.append((
             "wikipedia",
-            iter_wikipedia_documents(wikipedia_path, min_chunk_size),
+            iter_wikipedia_documents(wikipedia_path, max_chunk_size),
             float(os.path.getsize(wikipedia_path)) * 4,   # gz expands ~4x
         ))
 

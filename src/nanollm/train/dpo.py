@@ -7,8 +7,10 @@ Optimises
 
     -log sigmoid( beta * [ (pi_c - ref_c) - (pi_r - ref_r) ] )
 
-where pi/ref are summed log-probs of the chosen/rejected reply under the policy
-and the frozen reference. The reference is a copy of the initial policy: it
+where pi/ref are the per-token-averaged log-probs of the chosen/rejected reply
+under the policy and the frozen reference (see ``DPOConfig.length_normalize``;
+summing instead lets the logratio grow with reply length and the gradient blow
+past grad_clip every step). The reference is a copy of the initial policy: it
 never updates, and it is what keeps the policy from wandering arbitrarily far
 in pursuit of margin.
 """
@@ -87,8 +89,12 @@ def build_pair_batch(rows, pad_id: int):
     return tokens[:, :-1].contiguous(), labels[:, 1:].contiguous(), len(rows)
 
 
-def sequence_logprobs(model, xs, ys) -> torch.Tensor:
-    """Sum of log p(target) over unmasked positions, one value per sequence.
+def sequence_logprobs(model, xs, ys, length_normalize: bool = True) -> torch.Tensor:
+    """log p(target) over unmasked positions, one value per sequence.
+
+    With ``length_normalize`` (the default) the sum is divided by the number of
+    scored tokens, so the result is a mean and does not grow with reply length.
+    A sequence with no scored tokens returns 0.0 either way.
 
     Computed in chunks over the sequence for the same reason the pretraining
     loss is: a (B, T, vocab) fp32 logit tensor is the largest thing in the step.
@@ -96,6 +102,7 @@ def sequence_logprobs(model, xs, ys) -> torch.Tensor:
     hidden = model.forward_hidden(xs)
     chunk = model.loss_chunk_size or hidden.size(1)
     total = torch.zeros(xs.size(0), device=xs.device, dtype=torch.float32)
+    count = torch.zeros(xs.size(0), device=xs.device, dtype=torch.float32)
     for i in range(0, hidden.size(1), chunk):
         h = hidden[:, i:i + chunk]
         t = ys[:, i:i + chunk]
@@ -105,6 +112,9 @@ def sequence_logprobs(model, xs, ys) -> torch.Tensor:
         logp = torch.log_softmax(logits, dim=-1)
         picked = logp.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
         total = total + (picked * valid).sum(dim=-1)
+        count = count + valid.sum(dim=-1)
+    if length_normalize:
+        return total / count.clamp(min=1.0)
     return total
 
 
@@ -121,10 +131,17 @@ def dpo_loss(policy_lp, ref_lp, beta: float, label_smoothing: float = 0.0):
     else:
         loss = -F.logsigmoid(logits)
 
+    reward_chosen = beta * (pi_c - ref_c)
+    reward_rejected = beta * (pi_r - ref_r)
     stats = {
-        "margin": (pi_c - pi_r).mean().detach(),
-        "reward_chosen": (beta * (pi_c - ref_c)).mean().detach(),
-        "reward_rejected": (beta * (pi_r - ref_r)).mean().detach(),
+        # The headline diagnostics: a working run drives reward_margin positive
+        # and reward_accuracy toward 1. The scalar loss sits near ln 2 the whole
+        # time even when nothing is being learned, so log these, not the loss.
+        "reward_margin": (reward_chosen - reward_rejected).mean().detach(),
+        "reward_accuracy": (logits > 0).float().mean().detach(),
+        "reward_chosen": reward_chosen.mean().detach(),
+        "reward_rejected": reward_rejected.mean().detach(),
+        "margin": (pi_c - pi_r).mean().detach(),        # policy only, no ref
         "accuracy": (logits > 0).float().mean().detach(),
     }
     return loss.mean(), stats
@@ -273,36 +290,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     autocast = lambda: torch.autocast(device_type=device.type, dtype=amp_dtype,
                                       enabled=device.type == "cuda")
 
+    ln = cfg.dpo.length_normalize
+
     def compute(xs, ys):
         with torch.no_grad(), autocast():
-            ref_lp = sequence_logprobs(ref_model, xs, ys)
+            ref_lp = sequence_logprobs(ref_model, xs, ys, ln)
         with autocast():
-            policy_lp = sequence_logprobs(model, xs, ys)
+            policy_lp = sequence_logprobs(model, xs, ys, ln)
         loss, stats = dpo_loss(policy_lp, ref_lp, cfg.dpo.beta,
                                cfg.dpo.label_smoothing)
         if cfg.dpo.sft_loss_weight > 0:
             # Anchor the chosen branch. Pure DPO is satisfied by pushing both
             # log-probs down as long as the margin grows, which degrades the
             # policy while the loss looks healthy.
-            n_tokens = (ys[0::2] != IGNORE_INDEX).sum().clamp(min=1)
-            nll = -policy_lp[0::2].sum() / n_tokens
+            if ln:
+                nll = -policy_lp[0::2].mean()      # already per-token
+            else:
+                n_tokens = (ys[0::2] != IGNORE_INDEX).sum().clamp(min=1)
+                nll = -policy_lp[0::2].sum() / n_tokens
             loss = loss + cfg.dpo.sft_loss_weight * nll
             stats["nll_chosen"] = nll.detach()
         return loss, stats
 
     @torch.no_grad()
-    def evaluate() -> tuple[float, float]:
+    def evaluate() -> tuple[float, float, float]:
         model.eval()
         total = torch.zeros((), device=device)
         acc = torch.zeros((), device=device)
+        rmargin = torch.zeros((), device=device)
         for xs, ys in val_batches:
             loss, stats = compute(xs, ys)
             total += loss.detach()
-            acc += stats["accuracy"]
+            acc += stats["reward_accuracy"]
+            rmargin += stats["reward_margin"]
         model.train()
         n = max(1, len(val_batches))
         return (float(all_reduce_mean(total / n, env).item()),
-                float(all_reduce_mean(acc / n, env).item()))
+                float(all_reduce_mean(acc / n, env).item()),
+                float(all_reduce_mean(rmargin / n, env).item()))
 
     log.info("[4] Training")
     train_model.train()
@@ -316,7 +341,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     global_step = 0
     accum_micro = 0
-    accum = {"loss": 0.0, "accuracy": 0.0, "margin": 0.0}
+    accum = {"loss": 0.0, "reward_margin": 0.0, "reward_accuracy": 0.0,
+             "margin": 0.0}
     started = time.time()
     last_val = float("nan")
 
@@ -348,7 +374,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     scaled.backward()
 
             accum["loss"] += float(scaled.detach().item())
-            accum["accuracy"] += float(stats["accuracy"].item()) / micro_per_step
+            accum["reward_margin"] += float(stats["reward_margin"].item()) / micro_per_step
+            accum["reward_accuracy"] += float(stats["reward_accuracy"].item()) / micro_per_step
             accum["margin"] += float(stats["margin"].item()) / micro_per_step
             accum_micro += 1
             if not is_last_micro:
@@ -363,26 +390,33 @@ def main(argv: Optional[list[str]] = None) -> int:
             global_step += 1
             metrics.log_train(global_step, accum["loss"], lr,
                               float(grad_norm.item()), 0.0)
-            metrics.log(global_step, accuracy=accum["accuracy"],
-                        margin=accum["margin"])
+            metrics.log(global_step, reward_margin=accum["reward_margin"],
+                        reward_accuracy=accum["reward_accuracy"],
+                        logp_margin=accum["margin"])
             if pbar is not None:
                 pbar.update(1)
-                pbar.set_postfix({"loss": f"{accum['loss']:.4f}",
-                                  "acc": f"{accum['accuracy']:.2f}"})
+                pbar.set_postfix({"r_margin": f"{accum['reward_margin']:+.3f}",
+                                  "r_acc": f"{accum['reward_accuracy']:.2f}"})
 
             if global_step % cfg.runtime.log_every == 0:
                 log.info(f"    step {global_step}/{max_steps} "
                          f"| loss {accum['loss']:.4f} "
-                         f"| pref acc {accum['accuracy']:.3f} "
-                         f"| margin {accum['margin']:.3f} | lr {lr:.2e}")
+                         f"| reward margin {accum['reward_margin']:+.4f} "
+                         f"| reward acc {accum['reward_accuracy']:.3f} "
+                         f"| lr {lr:.2e}")
 
-            accum = {"loss": 0.0, "accuracy": 0.0, "margin": 0.0}
+            accum = {"loss": 0.0, "reward_margin": 0.0, "reward_accuracy": 0.0,
+                     "margin": 0.0}
             accum_micro = 0
 
             if global_step % cfg.dpo.val_every == 0:
-                last_val, val_acc = evaluate()
+                last_val, val_acc, val_rmargin = evaluate()
                 metrics.log_val(global_step, last_val)
-                log.info(f"    >> val loss {last_val:.4f} | pref acc {val_acc:.3f}")
+                metrics.log(global_step, val_reward_margin=val_rmargin,
+                            val_reward_accuracy=val_acc)
+                log.info(f"    >> val loss {last_val:.4f} "
+                         f"| reward margin {val_rmargin:+.4f} "
+                         f"| reward acc {val_acc:.3f}")
 
             if global_step % cfg.runtime.ckpt_every == 0 and env.is_main:
                 save_checkpoint(ckpt_path, model=model, optimizer=optimizer,
@@ -397,9 +431,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if accum_micro:
         optimizer.zero_grad(set_to_none=True)
 
-    last_val, val_acc = evaluate()
+    last_val, val_acc, val_rmargin = evaluate()
     metrics.log_val(global_step, last_val)
-    log.info(f"Final val loss {last_val:.4f} | preference accuracy {val_acc:.3f}")
+    metrics.log(global_step, val_reward_margin=val_rmargin,
+                val_reward_accuracy=val_acc)
+    log.info(f"Final val loss {last_val:.4f} | reward margin {val_rmargin:+.4f} "
+             f"| reward accuracy {val_acc:.3f}")
     log.info(f"    rendered {train_stream.rendered:,} pairs, "
              f"dropped {train_stream.dropped:,}")
 

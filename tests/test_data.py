@@ -4,7 +4,7 @@ import torch
 
 from nanollm.data.loader import BatchStream, TokenCorpus
 from nanollm.data.shards import ShardIndex, ShardWriter, read_shard
-from nanollm.data.sources import split_long_text
+from nanollm.data.sources import split_long_text, strip_foreign_scripts
 
 
 @pytest.fixture
@@ -88,6 +88,17 @@ def test_split_long_text_respects_bounds():
 
 def test_split_drops_short_documents():
     assert split_long_text("too short", min_chunk_size=100) == []
+
+
+def test_strip_foreign_scripts_keeps_punctuation_and_accents():
+    text = "“café” — naïve résumé: 3 ± 1 → €5 ½"
+    assert strip_foreign_scripts(text) == text          # nothing dropped
+
+
+def test_strip_foreign_scripts_drops_non_latin_letters():
+    assert strip_foreign_scripts("hello 你好 world") == "hello  world"
+    assert strip_foreign_scripts("price руб now") == "price  now"
+    assert strip_foreign_scripts("plain ascii") == "plain ascii"
 
 
 def test_out_of_space_raises_a_useful_error(tmp_path, monkeypatch):

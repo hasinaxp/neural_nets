@@ -40,6 +40,20 @@ optim:
   beta2: 0.95
   grad_clip: 1.0
 
+sft:
+  # One pass over the instruction data. Earlier 3-epoch runs showed val loss
+  # flat after epoch 1 (1.3986 -> 1.3968 over the last ~900 steps) while the
+  # extra passes kept eroding general language modelling.
+  epochs: 1
+
+dpo:
+  # Per-token (length-normalised) logratios, so beta carries roughly the mean
+  # reply length compared to a summed-logratio setup. peak_lr is 10x the old
+  # 5e-7: at that rate, with the gradient clipped ~18x every step, nothing moved.
+  length_normalize: true
+  beta: 2.0
+  peak_lr: 5.0e-6
+
 runtime:
   out_dir: artifacts
   log_dir: logs

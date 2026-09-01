@@ -163,7 +163,9 @@ class SFTConfig:
     The LR is two orders of magnitude below pretraining. At 3e-5 for three
     epochs the weights walk far enough off the pretrained solution that general
     language modelling degrades -- the model gets fluent at the SFT formats and
-    worse at everything else.
+    worse at everything else. Default is one epoch: past 3-epoch runs showed val
+    loss flat after the first (1.3986 -> 1.3968 over the last ~900 steps) while
+    epochs 2-3 kept eroding generality.
     """
 
     init_from: str = "artifacts/pretrain_model.pt"
@@ -171,7 +173,7 @@ class SFTConfig:
 
     micro_batch_size: int = 16
     grad_accum_steps: int = 2
-    epochs: int = 3
+    epochs: int = 1
     max_steps: int = 0             # 0 -> derive from epochs
 
     peak_lr: float = 1e-5
@@ -206,13 +208,19 @@ class DPOConfig:
     epochs: int = 1
     max_steps: int = 0
 
-    beta: float = 0.1              # KL strength; higher = stays nearer the ref
+    # Sequence log-probs are averaged over reply tokens, not summed: a summed
+    # logratio grows with reply length, which made the gradient blow past
+    # grad_clip on every step (norm ~18 vs clip 1.0) and biased the policy
+    # toward longer replies. With per-token logratios beta has to rise by
+    # roughly the mean reply length to keep the same preference signal.
+    length_normalize: bool = True
+    beta: float = 2.0             # KL strength; higher = stays nearer the ref
     label_smoothing: float = 0.0   # cDPO: assume this share of labels are noise
     sft_loss_weight: float = 0.1   # NLL on the chosen reply. Pure DPO can push
                                    # both log-probs down as long as the margin
                                    # grows; this anchors the chosen branch.
 
-    peak_lr: float = 5e-7
+    peak_lr: float = 5e-6
     min_lr_ratio: float = 0.1
     warmup_frac: float = 0.1
     weight_decay: float = 0.0

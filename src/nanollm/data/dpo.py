@@ -22,6 +22,8 @@ import re
 import pandas as pd
 from torch.utils.data import Dataset
 
+from .sources import strip_foreign_scripts
+
 DPO_DATASET_FOLDER = "dataset/dpo"
 MANIFEST_FILE = f"{DPO_DATASET_FOLDER}/manifest.json"
 CACHE_FOLDER = f"{DPO_DATASET_FOLDER}/cache"
@@ -55,7 +57,9 @@ MIN_PAIR_EDIT_RATIO = 0.02      # replies must differ by at least this fraction
 def _clean(text):
     if not isinstance(text, str):
         return ""
-    return text.encode("ascii", errors="ignore").decode("ascii").strip()
+    # Keep punctuation, symbols and accents; drop only non-Latin letters. The
+    # old encode("ascii") pass silently deleted curly quotes, em-dashes, etc.
+    return strip_foreign_scripts(text).strip()
 
 
 _HH_TURN = re.compile(r"\n\n(Human|Assistant):\s*")
