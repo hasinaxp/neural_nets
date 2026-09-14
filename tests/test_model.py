@@ -125,6 +125,47 @@ def test_residual_init_applied_once(tiny_config):
             assert 0.5 * expected < p.std().item() < 2.0 * expected, name
 
 
+def test_looped_residual_init_counts_executed_layers(looped_config):
+    """Depth for the residual scaling is passes, not weight sets: 4 blocks run
+    6 times write 12 contributions into the residual stream, not 8."""
+    import math
+    torch.manual_seed(0)
+    model = Transformer.from_config(looped_config)
+    expected = looped_config.init_std / math.sqrt(2 * looped_config.n_executed_layer)
+    for name, p in model.named_parameters():
+        if name.endswith(("wo.weight", "d.weight")):
+            assert 0.5 * expected < p.std().item() < 2.0 * expected, name
+
+
+def test_looped_kv_cache_matches_full_forward(looped_config):
+    """Each pass of a looped block needs its own cache slot. Sharing one slot
+    lets the second pass overwrite the first, and cached decoding then quietly
+    disagrees with a full forward."""
+    torch.manual_seed(0)
+    model = Transformer.from_config(looped_config).eval()
+    idx = torch.randint(0, looped_config.vocab_size, (2, 12))
+
+    full = model(idx)[0][:, -1]
+
+    cache = model.make_kv_cache(2, 16)
+    assert cache.num_layers == looped_config.n_executed_layer
+    model.forward_hidden(idx[:, :-1], start_pos=0, kv_cache=cache)
+    h = model.forward_hidden(idx[:, -1:], start_pos=idx.size(1) - 1,
+                             kv_cache=cache)
+    incremental = model.logit_proj(h[:, -1])
+
+    torch.testing.assert_close(incremental, full, atol=1e-4, rtol=1e-4)
+
+
+def test_looped_flops_scale_with_passes(looped_config):
+    import dataclasses
+    plain = dataclasses.replace(looped_config, repeat_times=1,
+                                repeat_start=0, repeat_end=0)
+    a = Transformer.from_config(plain).estimate_flops_per_token()
+    b = Transformer.from_config(looped_config).estimate_flops_per_token()
+    assert b > a          # same parameters, more compute per token
+
+
 def test_document_mask_blocks_across_eos():
     idx = torch.tensor([[1, 2, 9, 3, 4]])
     mask = build_document_mask(idx, eos_id=9)

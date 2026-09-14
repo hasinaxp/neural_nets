@@ -14,6 +14,8 @@ REPO = os.path.join(os.path.dirname(__file__), "..")
 
 COMMON = [
     "--set", "model.n_dim=64", "--set", "model.n_layer=2",
+    "--set", "model.repeat_start=0", "--set", "model.repeat_end=0",
+    "--set", "model.repeat_times=1",
     "--set", "model.n_head=2", "--set", "model.n_kv_head=1",
     "--set", "model.n_seq=64", "--set", "model.loss_chunk_size=32",
     "--set", "optim.micro_batch_size=2", "--set", "optim.grad_accum_steps=2",

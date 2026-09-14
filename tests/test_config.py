@@ -17,8 +17,33 @@ def test_head_dim_hits_the_fast_kernels():
 
 def test_estimate_matches_built_model():
     from nanollm.model import Transformer
-    cfg = ModelConfig(vocab_size=256, n_dim=64, n_layer=2, n_head=2, n_kv_head=1)
+    cfg = ModelConfig(vocab_size=256, n_dim=64, n_layer=2, n_head=2, n_kv_head=1,
+                      repeat_start=0, repeat_end=0, repeat_times=1)
     assert Transformer.from_config(cfg).get_param_count() == cfg.estimate_params()
+
+
+def test_looping_adds_depth_but_no_parameters():
+    """The whole point of the looped middle group: free depth."""
+    from nanollm.model import Transformer
+    plain = ModelConfig(vocab_size=256, n_dim=64, n_layer=4, n_head=2,
+                        n_kv_head=1, repeat_times=1, repeat_start=0, repeat_end=0)
+    looped = ModelConfig(vocab_size=256, n_dim=64, n_layer=4, n_head=2,
+                         n_kv_head=1, repeat_start=1, repeat_end=3, repeat_times=2)
+    assert plain.layer_schedule == (0, 1, 2, 3)
+    assert looped.layer_schedule == (0, 1, 2, 1, 2, 3)
+    assert looped.n_executed_layer == 6
+    assert looped.estimate_params() == plain.estimate_params()
+    assert (Transformer.from_config(looped).get_param_count()
+            == looped.estimate_params())
+
+
+def test_validate_rejects_bad_repeat_span():
+    with pytest.raises(ValueError):
+        ModelConfig(n_layer=16, repeat_start=4, repeat_end=20).validate()
+    with pytest.raises(ValueError):
+        ModelConfig(n_layer=16, repeat_start=8, repeat_end=4).validate()
+    with pytest.raises(ValueError):
+        ModelConfig(n_layer=16, repeat_times=0).validate()
 
 
 def test_validate_rejects_bad_geometry():

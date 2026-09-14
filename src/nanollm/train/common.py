@@ -22,6 +22,11 @@ __all__ = [
 PEAK_TFLOPS = {
     "a100": 312e12, "h100": 989e12, "h200": 989e12, "l40": 181e12,
     "a10": 125e12, "v100": 125e12, "rtx 4090": 165e12, "rtx 3090": 71e12,
+    # RTX PRO 6000 Blackwell: 24064 shaders at ~2.6GHz is ~125 TFLOP/s FP32,
+    # and the Blackwell tensor cores do bf16 with fp32 accumulate at 2x the
+    # shader rate (same ratio as Ada, where the 4090's 82.6 -> 165 above comes
+    # from). Dense, no sparsity.
+    "rtx pro 6000": 250e12,
 }
 
 

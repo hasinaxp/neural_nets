@@ -144,6 +144,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.info(f"    {cfg.summary(env.world_size)}")
     log.info(f"    actual params: {param_count:,} | n_kv_head {model.n_kv_head} "
              f"| head_dim {cfg.model.head_dim}")
+    if model.n_executed_layer != model.n_layer:
+        log.info(f"    layer schedule: {list(model.layer_schedule)} "
+                 f"({model.n_layer} blocks, {model.n_executed_layer} passes)")
 
     optimizer = build_optimizer(
         model, cfg.optim.peak_lr, cfg.optim.weight_decay,
@@ -176,6 +179,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "vocab_size": cfg.model.vocab_size, "n_dim": cfg.model.n_dim,
                     "n_layer": cfg.model.n_layer, "n_head": cfg.model.n_head,
                     "n_kv_head": cfg.model.n_kv_head, "n_seq": cfg.model.n_seq,
+                    # The repeat span changes what the weights mean without
+                    # changing a single tensor shape, so the shape check below
+                    # would happily load a checkpoint trained at another depth.
+                    "repeat_start": cfg.model.repeat_start,
+                    "repeat_end": cfg.model.repeat_end,
+                    "repeat_times": cfg.model.repeat_times,
                 })
             global_step = int(ck.get("global_step", 0))
             metrics.load(ck.get("history") or {})

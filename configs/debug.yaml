@@ -3,6 +3,11 @@ model:
   vocab_size: 32768
   n_dim: 256
   n_layer: 4
+  # Same looped shape as base.yaml in miniature -- blocks 1-2 run twice, so a
+  # smoke test still exercises the repeated schedule and its cache slots.
+  repeat_start: 1
+  repeat_end: 3
+  repeat_times: 2
   n_head: 4
   n_kv_head: 2
   n_seq: 256

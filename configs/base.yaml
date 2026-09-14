@@ -1,16 +1,33 @@
-# Reference run: ~186M parameters, 10.1B tokens (~54 tok/param).
+# Reference run: ~169M parameters, 16 unique layers executed 24 times,
+# 10.1B tokens (~60 tok/param).
 #
-# Sized for one 80GB A100 at micro_batch 16 x 2048 ctx. On smaller cards drop
-# micro_batch_size and raise grad_accum_steps by the same factor -- the global
-# batch, and therefore the loss curve, is unchanged.
+# Sized for one RTX PRO 6000 Blackwell (96GB) at micro_batch 32 x 2048 ctx:
+# ~65GB peak, ~95k tok/s compiled, so the 10.1B-token budget lands in ~30h.
+# On smaller cards drop micro_batch_size and raise grad_accum_steps by the same
+# factor -- the global batch, and therefore the loss curve, is unchanged.
 
 model:
   vocab_size: 32768
   n_dim: 896
-  n_layer: 18
+  n_layer: 16         # unique blocks; see repeat_* for the executed depth
   n_head: 14          # head_dim = 64, the size the flash kernels are tuned for
   n_kv_head: 2        # GQA, 7 query heads per KV head (Qwen2-0.5B geometry)
   n_seq: 2048
+
+  # Looped middle group: blocks 4-11 run, then run again on their own output,
+  # against the same weights.
+  #
+  #   0 1 2 3 | 4 5 6 7 8 9 10 11 | 4 5 6 7 8 9 10 11 | 12 13 14 15
+  #
+  # 24 executed layers from 16 weight sets. Depth is what the loss responds to
+  # most strongly at this size, and this buys 8 layers of it for zero extra
+  # parameters -- so the inference memory and the checkpoint stay 16-layer
+  # sized, and only FLOPs and activations go up (1.42 -> 1.96 GFLOP/token).
+  # The two ends stay single-pass: they convert to and from the residual basis
+  # rather than doing the iterative refinement that rewards a second pass.
+  repeat_start: 4
+  repeat_end: 12      # exclusive
+  repeat_times: 2     # 1 disables looping
   rope_theta: 10000.0
   dropout: 0.0
   tie_embeddings: true
@@ -28,11 +45,23 @@ data:
   seed: 1337
 
 optim:
-  micro_batch_size: 16
-  grad_accum_steps: 8       # global batch 128 seqs = 262k tokens/step
-  # 38400 x 262,144 = 10.07B tokens. Well past Chinchilla-optimal for 186M
+  # Measured on this card, compiled, 24 executed layers at 2048 ctx:
+  #   micro   8 -> 89k tok/s, 18GB     micro 24 -> 93k tok/s, 49GB
+  #   micro  16 -> 92k tok/s, 34GB     micro 32 -> 95k tok/s, 65GB
+  #                                    micro 40 -> 95k tok/s, 80GB
+  # Throughput is flat past 32 while memory keeps climbing, so 32 is the knee:
+  # it leaves ~30GB of the 96GB free for allocator fragmentation and the
+  # sampling KV cache instead of buying 0% more speed.
+  micro_batch_size: 32
+  grad_accum_steps: 4       # global batch 128 seqs = 262k tokens/step
+  # Global batch is deliberately unchanged from the 16x8 reference run, so
+  # peak_lr below is still the tuned value for it.
+  #
+  # 38400 x 262,144 = 10.07B tokens. Well past Chinchilla-optimal for 169M
   # params, which is the point: inference cost is fixed by the parameter count,
-  # so the extra tokens are the cheapest quality available at this size.
+  # so the extra tokens are the cheapest quality available at this size. The
+  # looped layers do not change that -- they cost FLOPs at inference, not
+  # memory, so the budget is still worth spending.
   max_steps: 38400
   peak_lr: 5.0e-4
   min_lr_ratio: 0.1
@@ -76,14 +105,26 @@ dpo:
 runtime:
   out_dir: artifacts
   log_dir: logs
+  # compile is worth more here than any batch-size choice: eager tops out at
+  # ~54k tok/s, compiled default reaches ~94k, and max-autotune-no-cudagraphs
+  # ~95k for a longer one-off warmup. Plain "max-autotune" is NOT usable: its
+  # cudagraphs capture the lazily-built RoPE cos/sin cache and then overwrite
+  # it between steps.
   compile: true
-  compile_mode: default
+  compile_mode: max-autotune-no-cudagraphs
+  # Autocast dtype, not storage: weights, AdamW moments and gradients stay
+  # fp32, and RMSNorm plus the logits/CE/z-loss are explicitly upcast. No
+  # GradScaler is built for bf16 -- it has fp32's exponent range.
   dtype: bfloat16
   log_every: 50
   eval_every: 500
   sample_every: 1000
-  ckpt_every: 500
-  snapshot_every: 5000
+  # ~0.69s/step, so this is a checkpoint every ~11 min; a crash costs that
+  # much work and no more. Each write is ~2GB (fp32 weights + Adam moments).
+  ckpt_every: 1000
+  # 4 permanent snapshots, not 8: /home has ~55GB free and the 10B-token shard
+  # set will want ~20GB of it.
+  snapshot_every: 9600
   plot_every: 200
   tensorboard: false
   wandb: false

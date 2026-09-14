@@ -11,6 +11,11 @@ Design notes that matter for training stability at this scale:
 * **z-loss** penalises drift in log Z, cheap insurance at a high peak LR.
 * **No padding_idx** on the embedding: with tied weights it permanently pins
   row 0's output logit to 0, so token 0 could never be predicted.
+* **Looped middle blocks.** ``layer_schedule`` decides which block runs when,
+  so a contiguous middle group can run more than once against the same weights
+  -- extra effective depth for no extra parameters. Everything downstream that
+  is per-layer-execution rather than per-weight-set (KV cache slots, residual
+  init scaling, the FLOP estimate) counts ``n_executed_layer``.
 """
 
 from __future__ import annotations
@@ -29,12 +34,12 @@ import torch.nn.functional as F
 # pull it in first.
 import torch.utils.checkpoint
 
-from .config import ModelConfig, swiglu_hidden_dim
+from .config import ModelConfig, layer_schedule, swiglu_hidden_dim
 
 DEFAULT_SEQ_LEN = 2048
 DEFAULT_EMBEDDING_DIM = 896
 DEFAULT_NUM_HEADS = 14
-DEFAULT_NUM_LAYERS = 18
+DEFAULT_NUM_LAYERS = 16
 DEFAULT_NUM_EXPERTS = 1
 DEFAULT_TOP_K = 1
 
@@ -43,7 +48,7 @@ IGNORE_INDEX = -100
 __all__ = [
     "Transformer", "RMSNorm", "AttentionGQA", "SwiGLU", "FFN", "Block",
     "KVCache", "IGNORE_INDEX", "swiglu_hidden_dim", "build_document_mask",
-    "precompute_rope", "apply_rope", "default_n_kv_head",
+    "precompute_rope", "apply_rope", "default_n_kv_head", "layer_schedule",
 ]
 
 
@@ -84,11 +89,19 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 class KVCache:
     """Pre-allocated key/value cache. One tensor for all layers keeps the
-    allocation count down and the layout contiguous."""
+    allocation count down and the layout contiguous.
+
+    ``num_layers`` is the number of *executed* layers, not the number of unique
+    blocks. A looped block runs on a different residual stream each time
+    through, so its two passes produce different keys and values and need
+    separate slots; sharing one slot would have the second pass overwrite the
+    first and make cached decoding disagree with a full forward.
+    """
 
     def __init__(self, batch_size, max_seq_len, num_layers, n_kv_head,
                  head_dim, device, dtype, **_legacy):
         self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
         shape = (num_layers, batch_size, n_kv_head, max_seq_len, head_dim)
         self.k = torch.empty(shape, device=device, dtype=dtype)
         self.v = torch.empty_like(self.k)
@@ -129,7 +142,8 @@ class AttentionGQA(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, cos, sin, start_pos=0, kv_cache=None, attn_mask=None):
+    def forward(self, x, cos, sin, start_pos=0, kv_cache=None, attn_mask=None,
+                cache_idx=None):
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -145,7 +159,11 @@ class AttentionGQA(nn.Module):
         k = apply_rope(k, c, s)
 
         if kv_cache is not None:
-            k, v = kv_cache.update(self.layer_idx, start_pos, k, v)
+            # cache_idx is the position in the execution schedule, which is what
+            # a cache slot corresponds to; it only equals layer_idx when no
+            # block is looped.
+            slot = self.layer_idx if cache_idx is None else cache_idx
+            k, v = kv_cache.update(slot, start_pos, k, v)
 
         if self.n_rep > 1:
             # expand, not repeat_interleave: no copy, SDPA broadcasts fine
@@ -201,9 +219,11 @@ class Block(nn.Module):
         self.ffn = SwiGLU(n_dim, hidden_dim)
         self.resid_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x, cos, sin, start_pos=0, kv_cache=None, attn_mask=None):
+    def forward(self, x, cos, sin, start_pos=0, kv_cache=None, attn_mask=None,
+                cache_idx=None):
         x = x + self.resid_dropout(
-            self.attn(self.attn_norm(x), cos, sin, start_pos, kv_cache, attn_mask))
+            self.attn(self.attn_norm(x), cos, sin, start_pos, kv_cache,
+                      attn_mask, cache_idx))
         x = x + self.resid_dropout(self.ffn(self.ffn_norm(x)))
         return x
 
@@ -246,6 +266,9 @@ class Transformer(nn.Module):
         n_head=DEFAULT_NUM_HEADS,
         n_dim=DEFAULT_EMBEDDING_DIM,
         n_seq=DEFAULT_SEQ_LEN,
+        repeat_start=0,
+        repeat_end=0,
+        repeat_times=1,
         num_experts=DEFAULT_NUM_EXPERTS,      # accepted, unused (dense)
         top_k=DEFAULT_TOP_K,                  # accepted, unused (dense)
         rope_theta=10000.0,
@@ -275,6 +298,14 @@ class Transformer(nn.Module):
 
         self.vocab_size = vocab_size
         self.n_layer = n_layer
+        # Execution order over self.blocks. Stored as a plain tuple of ints so
+        # dynamo unrolls the loop and bakes the order into the graph.
+        self.layer_schedule = layer_schedule(
+            n_layer, repeat_start, repeat_end, repeat_times)
+        self.n_executed_layer = len(self.layer_schedule)
+        self.repeat_start = repeat_start
+        self.repeat_end = repeat_end
+        self.repeat_times = repeat_times
         self.n_head = n_head
         self.n_dim = n_dim
         self.n_seq = n_seq
@@ -313,9 +344,17 @@ class Transformer(nn.Module):
         # GPT-2 residual scaling. Applied here and nowhere else -- a second
         # pass over these tensors in the training script would square the
         # factor and start the run at std/(2*n_layer).
+        #
+        # The divisor counts *executed* layers, not unique blocks: what the
+        # scaling controls is the variance of the residual stream at the top,
+        # and that grows with the number of additions into it. A looped block
+        # writes into the residual stream once per pass, so with 16 blocks run
+        # 24 times the stream sees 48 contributions, not 32.
+        residual_depth = self.n_executed_layer
         for name, p in self.named_parameters():
             if name.endswith(("wo.weight", "d.weight")):
-                nn.init.normal_(p, mean=0.0, std=init_std / math.sqrt(2 * n_layer))
+                nn.init.normal_(
+                    p, mean=0.0, std=init_std / math.sqrt(2 * residual_depth))
 
     # -- construction -------------------------------------------------------
 
@@ -328,6 +367,9 @@ class Transformer(nn.Module):
             n_head=cfg.n_head,
             n_dim=cfg.n_dim,
             n_seq=cfg.n_seq,
+            repeat_start=cfg.repeat_start,
+            repeat_end=cfg.repeat_end,
+            repeat_times=cfg.repeat_times,
             rope_theta=cfg.rope_theta,
             dropout=cfg.dropout,
             n_kv_head=cfg.n_kv_head,
@@ -373,13 +415,14 @@ class Transformer(nn.Module):
         max_len = self.n_seq if kv_cache is None else kv_cache.max_seq_len
         cos, sin = self._get_rope(max_len, x.device)
 
-        for block in self.blocks:
+        for slot, layer in enumerate(self.layer_schedule):
+            block = self.blocks[layer]
             if self.activation_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    block, x, cos, sin, start_pos, kv_cache, attn_mask,
+                    block, x, cos, sin, start_pos, kv_cache, attn_mask, slot,
                     use_reentrant=False)
             else:
-                x = block(x, cos, sin, start_pos, kv_cache, attn_mask)
+                x = block(x, cos, sin, start_pos, kv_cache, attn_mask, slot)
 
         return self.final_norm(x)
 
@@ -482,7 +525,7 @@ class Transformer(nn.Module):
         return KVCache(
             batch_size=batch_size,
             max_seq_len=max_seq_len,
-            num_layers=self.n_layer,
+            num_layers=self.n_executed_layer,
             n_kv_head=self.n_kv_head,
             head_dim=self.n_dim // self.n_head,
             device=device or p.device,
@@ -597,9 +640,18 @@ class Transformer(nn.Module):
         ]
 
     def estimate_flops_per_token(self):
-        n = self.get_param_count()
-        attn = 12 * self.n_layer * self.n_dim * self.n_seq
-        return 6 * n + attn
+        """6 * (weights actually multiplied through) + attention score cost.
+
+        Not 6 * param_count: a looped block contributes its FLOPs once per pass,
+        so the count is over executed layers. The embedding is a gather, not a
+        matmul, and contributes nothing; the tied output projection is a matmul
+        and contributes once.
+        """
+        per_layer = sum(p.numel() for p in self.blocks[0].parameters())
+        matmul_params = (per_layer * self.n_executed_layer
+                         + self.vocab_size * self.n_dim)
+        attn = 12 * self.n_executed_layer * self.n_dim * self.n_seq
+        return 6 * matmul_params + attn
 
     def estimate_mfu(self, tokens_per_sec: float, peak_flops: float) -> float:
         """Model FLOPs utilisation against a device's dense peak."""

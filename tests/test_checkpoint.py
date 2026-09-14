@@ -13,7 +13,8 @@ from nanollm.utils.checkpoint import (ArchitectureMismatch, atomic_save,
 @pytest.fixture
 def small():
     return ModelConfig(vocab_size=128, n_dim=32, n_layer=2, n_head=2,
-                       n_kv_head=1, n_seq=32)
+                       n_kv_head=1, n_seq=32,
+                       repeat_start=0, repeat_end=0, repeat_times=1)
 
 
 def test_atomic_save_leaves_no_temp_file(tmp_path):

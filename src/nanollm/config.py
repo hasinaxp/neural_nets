@@ -31,6 +31,8 @@ __all__ = [
     "TrainConfig",
     "load_config",
     "apply_overrides",
+    "layer_schedule",
+    "swiglu_hidden_dim",
 ]
 
 
@@ -40,19 +42,36 @@ __all__ = [
 
 @dataclass
 class ModelConfig:
-    """Architecture. Defaults describe the ~186M reference model.
+    """Architecture. Defaults describe the ~169M-parameter reference model,
+    16 unique layers executed 24 times.
 
     n_dim / n_head is chosen so head_dim == 64: the flash-attention kernels are
     tuned for head_dim in (32, 64, 128) and fall back to a much slower math
     kernel otherwise. 896/14 is the same head geometry as Qwen2-0.5B.
+
+    ``repeat_*`` loops a contiguous middle group of blocks: the group runs once,
+    then its own output is fed back through the *same* weights again. Depth is
+    what the loss curve responds to most strongly at this scale, and a looped
+    group buys it at zero parameter cost -- the extra depth is free in VRAM for
+    the weights and in inference memory, and paid for only in FLOPs and
+    activations. Layers next to the embedding and next to the output head stay
+    single-pass: those two ends do format conversion rather than the iterative
+    refinement that rewards looping.
     """
 
     vocab_size: int = 32768        # padded to a multiple of 64 at build time
     n_dim: int = 896
-    n_layer: int = 18
+    n_layer: int = 16              # unique blocks (weight sets)
     n_head: int = 14               # head_dim = 896 / 14 = 64
     n_kv_head: int = 2             # GQA: 7 query heads share each KV head
     n_seq: int = 2048
+
+    # Looped middle group: blocks [repeat_start, repeat_end) run repeat_times
+    # times in sequence. 4..11 twice -> 4 + 8 + 8 + 4 = 24 executed layers.
+    repeat_start: int = 4
+    repeat_end: int = 12           # exclusive
+    repeat_times: int = 2          # 1 disables looping entirely
+
     rope_theta: float = 10000.0
     dropout: float = 0.0
     tie_embeddings: bool = True
@@ -65,6 +84,16 @@ class ModelConfig:
     def head_dim(self) -> int:
         return self.n_dim // self.n_head
 
+    @property
+    def layer_schedule(self) -> tuple[int, ...]:
+        """Block indices in execution order; len() is the effective depth."""
+        return layer_schedule(self.n_layer, self.repeat_start,
+                              self.repeat_end, self.repeat_times)
+
+    @property
+    def n_executed_layer(self) -> int:
+        return len(self.layer_schedule)
+
     def validate(self) -> None:
         if self.n_dim % self.n_head:
             raise ValueError(f"n_dim={self.n_dim} not divisible by n_head={self.n_head}")
@@ -73,6 +102,8 @@ class ModelConfig:
                 f"n_head={self.n_head} not divisible by n_kv_head={self.n_kv_head}")
         if self.head_dim % 2:
             raise ValueError(f"head_dim={self.head_dim} must be even for RoPE")
+        validate_repeat(self.n_layer, self.repeat_start, self.repeat_end,
+                        self.repeat_times)
 
     def estimate_params(self) -> int:
         """Parameter count without building the model. Matches
@@ -93,6 +124,31 @@ def swiglu_hidden_dim(n_dim: int, multiple_of: int = 256) -> int:
     """8/3 * n_dim keeps a SwiGLU FFN param-matched to a 4x GELU FFN."""
     hidden = int(8 * n_dim / 3)
     return ((hidden + multiple_of - 1) // multiple_of) * multiple_of
+
+
+def validate_repeat(n_layer: int, start: int, end: int, times: int) -> None:
+    if times < 1:
+        raise ValueError(f"repeat_times={times} must be >= 1")
+    if not 0 <= start <= end <= n_layer:
+        raise ValueError(
+            f"repeat span [{start}, {end}) is not inside [0, {n_layer})")
+    if times > 1 and start == end:
+        raise ValueError(
+            f"repeat_times={times} with an empty span [{start}, {end}) repeats "
+            f"nothing; set repeat_times=1 to disable looping")
+
+
+def layer_schedule(n_layer: int, start: int, end: int,
+                   times: int) -> tuple[int, ...]:
+    """Block indices in execution order.
+
+    The middle group is looped as a *group* -- 0 1 2 3 | 4..11 | 4..11 | 12..15
+    -- not per layer (4 4 5 5 ...). The whole group seeing its own output is
+    what makes the second pass a refinement step rather than a wider layer.
+    """
+    validate_repeat(n_layer, start, end, times)
+    middle = list(range(start, end))
+    return tuple(list(range(start)) + middle * times + list(range(end, n_layer)))
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +380,8 @@ class TrainConfig:
         return (
             f"params ~{p/1e6:.1f}M (non-embedding "
             f"{(p - self.model.vocab_size*self.model.n_dim)/1e6:.1f}M) | "
+            f"depth {self.model.n_layer} unique / "
+            f"{self.model.n_executed_layer} executed | "
             f"head_dim {self.model.head_dim} | "
             f"tokens/step {tps:,} | budget {budget/1e9:.2f}B "
             f"({budget/max(1, p):.1f} tok/param, Chinchilla ~20)"
