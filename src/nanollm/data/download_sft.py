@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 
 from huggingface_hub import list_repo_files, hf_hub_download
 from tqdm import tqdm
@@ -38,7 +39,13 @@ REPOS = {
     "soda": {
         "id": "allenai/soda",
         "task": "chat",
-        "max_rows": 60_000,          # 1.5M rows upstream; way past what 110M needs
+        "max_rows": 60_000,
+        # Off. soda is narrative dialogue between two *named characters*, and
+        # the normalizer can only map them onto user/assistant by turn parity.
+        # That teaches the model to play a random person in a chat rather than
+        # to be an assistant -- inside the highest-weighted task. smol-smoltalk
+        # covers multi-turn chat with an actual assistant on one side.
+        "enabled": False,
     },
     # ---- extractive QA -----------------------------------------------------
     "squad-v2": {
@@ -66,7 +73,9 @@ REPOS = {
         "id": "EdinburghNLP/xsum",
         "task": "summarization",
         "max_rows": 40_000,
-        "enabled": False,            # long inputs; enable once 1024 ctx is not the cap
+        # On: sft.seq_len is 2048 now, so the long articles this was disabled
+        # for mostly fit. It is also the only non-dialogue summarization source
+        # here -- without it the task is entirely chat transcripts.
     },
     # ---- text to SQL -------------------------------------------------------
     "sql-create-context": {
@@ -86,18 +95,42 @@ REPOS = {
         "max_rows": None,
     },
     # ---- math (chain-of-thought word problems) -----------------------------
+    # gsm8k alone is ~7.5k rows, and at a 0.10 task weight that was small
+    # enough to set the size of the entire SFT epoch through the min() in
+    # _build_mixture -- 88% of the chat data went unused so gsm8k could be
+    # repeated 3x. These two bring the math pool to ~130k so it stops being
+    # the binding constraint; the mixture sizing is also fixed independently.
     "gsm8k": {
         "id": "openai/gsm8k",
         "task": "math",
         "config": "main",            # repo also has a "socratic" variant
         "max_rows": None,            # ~7.5k train rows
     },
+    "metamath": {
+        "id": "meta-math/MetaMathQA",
+        "task": "math",
+        "max_rows": 60_000,          # ~395k upstream, GSM8K/MATH augmentations
+    },
+    "orca-math": {
+        "id": "microsoft/orca-math-word-problems-200k",
+        "task": "math",
+        "max_rows": 60_000,          # ~200k upstream, worked solutions
+    },
     # ---- reasoning (grounded multiple-choice) -------------------------------
+    # Replies here are deliberately terse ("B) ...") with no rationale, which
+    # is consistent with what the prompt asks for. The CoT habit is taught by
+    # the math task, whose prompts explicitly ask for reasoning.
     "arc-challenge": {
         "id": "allenai/ai2_arc",
         "task": "reasoning",
-        "config": "ARC-Challenge",   # repo also has ARC-Easy
+        "config": "ARC-Challenge",
         "max_rows": None,            # ~1.1k train rows
+    },
+    "arc-easy": {
+        "id": "allenai/ai2_arc",
+        "task": "reasoning",
+        "config": "ARC-Easy",        # ~2.25k more rows, same schema
+        "max_rows": None,
     },
     "commonsense-qa": {
         "id": "tau/commonsense_qa",
@@ -112,12 +145,21 @@ def prepare_folders():
         os.makedirs(f"{DATASET_FOLDER}/{key}", exist_ok=True)
 
 
+_SPLIT_TOKEN = re.compile(r"[^a-z0-9]")
+
+
+def _split_tokens(path):
+    """Path -> the set of word-ish tokens in it, so "latest" never reads as
+    "test" and "contest/" never reads as a test split."""
+    return set(t for t in _SPLIT_TOKEN.split(path.lower()) if t)
+
+
 def wanted_split(path):
     """True if this remote path belongs to a split we keep."""
-    lowered = path.lower()
-    if "test" in lowered and not any(s in lowered for s in ("latest",)):
+    tokens = _split_tokens(path)
+    if "test" in tokens:
         return False
-    return any(s in lowered for s in KEEP_SPLITS)
+    return bool(tokens & set(KEEP_SPLITS))
 
 
 def download_parquet_files(key, force=False):
@@ -256,13 +298,15 @@ def download_dataset(key, force=False):
     repo = REPOS[key]
     print(f"Listing {key} ({repo['id']}) files...")
 
+    # Always try parquet first, cap or no cap. Gating this on max_rows sent
+    # every capped source through load_dataset(), which materialises the whole
+    # repo before subsampling -- soda downloaded 1.5M rows to keep 60k. The cap
+    # is applied locally afterwards by subsample_in_place().
     paths = None
-    if not repo.get("max_rows"):
-        # No cap, so a straight parquet copy is enough.
-        try:
-            paths = download_parquet_files(key, force=force)
-        except Exception as e:
-            print(f"  parquet path failed ({e}); falling back to datasets")
+    try:
+        paths = download_parquet_files(key, force=force)
+    except Exception as e:
+        print(f"  parquet path failed ({e}); falling back to datasets")
 
     if paths is None:
         paths = download_via_datasets(key, force=force)

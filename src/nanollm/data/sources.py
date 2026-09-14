@@ -13,7 +13,14 @@ import unicodedata
 from typing import Iterator, Optional
 
 RAW_DATASET_FOLDER = "dataset/raw"
-OMIT_LANGUAGE_CHECK_FILEPATTERNS = ["cosmopedia"]
+# Sources whose "language" column does not mean natural language. cosmopedia is
+# synthetic English throughout; python-edu's column says "Python", so the
+# lang == "en" filter below would otherwise discard the entire corpus silently.
+OMIT_LANGUAGE_CHECK_FILEPATTERNS = ["cosmopedia", "python-edu"]
+
+# Column holding the document body, in probe order. Web corpora use "text";
+# the code corpora use "content".
+TEXT_COLUMN_CANDIDATES = ("text", "content")
 
 MINIMUM_CHUNK_SIZE = 1024
 # A chunk is the longest span the model will ever see as one coherent context.
@@ -25,6 +32,7 @@ MAXIMUM_CHUNK_SIZE = 12 * 1024
 __all__ = [
     "list_parquet_files", "iter_parquet_documents", "iter_wikipedia_documents",
     "iter_all_documents", "split_long_text", "strip_foreign_scripts", "source_of",
+    "TEXT_COLUMN_CANDIDATES",
 ]
 
 
@@ -120,14 +128,26 @@ def iter_parquet_documents(
 
     pf = pq.ParquetFile(filepath)
     available = set(pf.schema_arrow.names)
+
+    text_column = next(
+        (c for c in TEXT_COLUMN_CANDIDATES if c in available), None)
+    if text_column is None:
+        # Reached by the metadata-only code dumps (smollm-corpus python-edu and
+        # the-stack-v2 ship blob ids, not source). Skipping loudly beats
+        # yielding nothing and leaving the token count quietly short.
+        raise ValueError(
+            f"{filepath}: no text column (looked for "
+            f"{', '.join(TEXT_COLUMN_CANDIDATES)}); columns are "
+            f"{', '.join(sorted(available))}")
+
     check_language = (
         "language" in available
         and not any(p in filepath for p in OMIT_LANGUAGE_CHECK_FILEPATTERNS)
     )
-    columns = ["text", "language"] if check_language else ["text"]
+    columns = [text_column, "language"] if check_language else [text_column]
 
     for batch in pf.iter_batches(batch_size=row_group_batch, columns=columns):
-        texts = batch.column("text").to_pylist()
+        texts = batch.column(text_column).to_pylist()
         if check_language:
             langs = batch.column("language").to_pylist()
             texts = [t for t, lang in zip(texts, langs) if lang == "en"]

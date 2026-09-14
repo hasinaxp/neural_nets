@@ -11,7 +11,7 @@ install:  ## editable install with every extra
 	pip install -e ".[all]"
 
 data:  ## download the pretraining corpus
-	$(PY) scripts/download_data.py pretrain --budget-gb 40
+	$(PY) scripts/download_data.py pretrain --budget-gb 70
 
 tokenizer:  ## train the BPE tokenizer
 	$(PY) scripts/train_tokenizer.py --vocab-size 32768

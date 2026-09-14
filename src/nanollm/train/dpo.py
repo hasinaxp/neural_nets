@@ -92,30 +92,13 @@ def build_pair_batch(rows, pad_id: int):
 def sequence_logprobs(model, xs, ys, length_normalize: bool = True) -> torch.Tensor:
     """log p(target) over unmasked positions, one value per sequence.
 
-    With ``length_normalize`` (the default) the sum is divided by the number of
-    scored tokens, so the result is a mean and does not grow with reply length.
-    A sequence with no scored tokens returns 0.0 either way.
-
-    Computed in chunks over the sequence for the same reason the pretraining
-    loss is: a (B, T, vocab) fp32 logit tensor is the largest thing in the step.
+    Thin wrapper over ``Transformer.sequence_logprobs``/``DDP.forward``. The
+    policy branch must go through the DDP wrapper -- reaching past it to the
+    inner module leaves the gradients unsynchronised across ranks -- so the
+    work itself lives on the model and this dispatches by ``mode``.
     """
-    hidden = model.forward_hidden(xs)
-    chunk = model.loss_chunk_size or hidden.size(1)
-    total = torch.zeros(xs.size(0), device=xs.device, dtype=torch.float32)
-    count = torch.zeros(xs.size(0), device=xs.device, dtype=torch.float32)
-    for i in range(0, hidden.size(1), chunk):
-        h = hidden[:, i:i + chunk]
-        t = ys[:, i:i + chunk]
-        logits = model.logit_proj(h).float()
-        valid = t != IGNORE_INDEX
-        safe = t.masked_fill(~valid, 0)
-        logp = torch.log_softmax(logits, dim=-1)
-        picked = logp.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
-        total = total + (picked * valid).sum(dim=-1)
-        count = count + valid.sum(dim=-1)
-    if length_normalize:
-        return total / count.clamp(min=1.0)
-    return total
+    return model(xs, targets=ys, mode="seq_logprobs",
+                 length_normalize=length_normalize)
 
 
 def dpo_loss(policy_lp, ref_lp, beta: float, label_smoothing: float = 0.0):
@@ -236,7 +219,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     log.info("[3] Data")
     train_ds = DPODataset(batch_size=cfg.dpo.micro_batch_size, split="train",
-                          epochs=1, seed=cfg.data.seed)
+                          epochs=1, seed=cfg.data.seed,
+                          total_examples=cfg.dpo.mixture_pairs or None)
     val_ds = DPODataset(batch_size=cfg.dpo.micro_batch_size, split="val",
                         seed=cfg.data.seed)
     for line in train_ds.describe().splitlines():
@@ -292,11 +276,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     ln = cfg.dpo.length_normalize
 
-    def compute(xs, ys):
+    def compute(xs, ys, policy=None):
+        # ref_model is never wrapped in DDP (it has no gradients), so it is
+        # called directly; the policy goes through train_model so the reducer
+        # is armed. `policy` lets evaluate() bypass DDP under no_grad.
         with torch.no_grad(), autocast():
             ref_lp = sequence_logprobs(ref_model, xs, ys, ln)
         with autocast():
-            policy_lp = sequence_logprobs(model, xs, ys, ln)
+            policy_lp = sequence_logprobs(policy if policy is not None
+                                          else train_model, xs, ys, ln)
         loss, stats = dpo_loss(policy_lp, ref_lp, cfg.dpo.beta,
                                cfg.dpo.label_smoothing)
         if cfg.dpo.sft_loss_weight > 0:
@@ -319,7 +307,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         acc = torch.zeros((), device=device)
         rmargin = torch.zeros((), device=device)
         for xs, ys in val_batches:
-            loss, stats = compute(xs, ys)
+            loss, stats = compute(xs, ys, policy=model)
             total += loss.detach()
             acc += stats["reward_accuracy"]
             rmargin += stats["reward_margin"]

@@ -22,6 +22,12 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Explicit: `torch.utils.checkpoint` is a submodule, not an attribute of
+# `torch.utils`, so `import torch` alone does not bind it. Both the activation
+# checkpointing in forward_hidden and the chunked loss reach for it, and they
+# only worked because something else in the trainer import graph happened to
+# pull it in first.
+import torch.utils.checkpoint
 
 from .config import ModelConfig, swiglu_hidden_dim
 
@@ -377,9 +383,26 @@ class Transformer(nn.Module):
 
         return self.final_norm(x)
 
-    def forward(self, idx, start_pos=0, kv_cache=None, attn_mask=None):
+    def forward(self, idx, start_pos=0, kv_cache=None, attn_mask=None,
+                mode="logits", targets=None, length_normalize=True):
         """Returns (logits, None). The second element is vestigial -- it used to
-        carry an MoE aux loss that was always literally 0.0."""
+        carry an MoE aux loss that was always literally 0.0.
+
+        ``mode`` exists so every training objective can be reached *through*
+        ``forward``. Under DDP the reducer is armed by ``DDP.forward`` and by
+        nothing else: calling ``model.calculate_loss(...)`` on the inner module
+        runs a perfectly good forward and backward whose gradients are then
+        never all-reduced, so each rank silently trains its own divergent copy.
+        Every trainer therefore calls ``train_model(xs, targets=ys, mode=...)``.
+        """
+        if mode == "loss":
+            return self.calculate_loss(idx, targets, attn_mask=attn_mask)
+        if mode == "seq_logprobs":
+            return self.sequence_logprobs(
+                idx, targets, attn_mask=attn_mask,
+                length_normalize=length_normalize)
+        if mode == "hidden":
+            return self.forward_hidden(idx, start_pos, kv_cache, attn_mask)
         x = self.forward_hidden(idx, start_pos, kv_cache, attn_mask)
         return self.logit_proj(x), None
 
@@ -421,6 +444,36 @@ class Transformer(nn.Module):
         if self.z_loss_weight:
             loss = loss + self.z_loss_weight * (z_sum / n)
         return loss
+
+    def sequence_logprobs(self, xs, ys, attn_mask=None,
+                          length_normalize: bool = True):
+        """log p(target) summed over unmasked positions, one value per sequence.
+
+        Lives on the model rather than in the DPO trainer so the whole thing --
+        hidden states *and* the tied output projection -- sits inside a single
+        ``forward``, which is what DDP needs in order to all-reduce.
+
+        Chunked over the sequence for the same reason the CE loss is: a
+        (B, T, vocab) fp32 tensor is the largest thing in the step. A sequence
+        with no scored tokens returns 0.0.
+        """
+        hidden = self.forward_hidden(xs, attn_mask=attn_mask)
+        chunk = self.loss_chunk_size or hidden.size(1)
+        total = torch.zeros(xs.size(0), device=xs.device, dtype=torch.float32)
+        count = torch.zeros(xs.size(0), device=xs.device, dtype=torch.float32)
+        for i in range(0, hidden.size(1), chunk):
+            h = hidden[:, i:i + chunk]
+            t = ys[:, i:i + chunk]
+            logits = self.logit_proj(h).float()
+            valid = t != IGNORE_INDEX
+            safe = t.masked_fill(~valid, 0)
+            logp = torch.log_softmax(logits, dim=-1)
+            picked = logp.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
+            total = total + (picked * valid).sum(dim=-1)
+            count = count + valid.sum(dim=-1)
+        if length_normalize:
+            return total / count.clamp(min=1.0)
+        return total
 
     # -- inference ----------------------------------------------------------
 

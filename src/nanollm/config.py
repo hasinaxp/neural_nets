@@ -132,7 +132,7 @@ class OptimConfig:
     # Global batch is micro_batch * grad_accum * world_size, in sequences.
     micro_batch_size: int = 16
     grad_accum_steps: int = 8
-    max_steps: int = 24000
+    max_steps: int = 38400
 
     peak_lr: float = 5e-4
     min_lr_ratio: float = 0.1
@@ -169,12 +169,25 @@ class SFTConfig:
     """
 
     init_from: str = "artifacts/pretrain_model.pt"
-    seq_len: int = 1024
+    # Matches the pretrained n_seq. At 1024 the back half of the context never
+    # saw a chat template, a role marker, or an EOS during fine-tuning, so
+    # long-form behaviour past 1024 tokens was whatever pretraining left there.
+    # It was also the reason long multi-turn chats were dropped at render time
+    # and why xsum had to stay disabled.
+    seq_len: int = 2048
 
-    micro_batch_size: int = 16
-    grad_accum_steps: int = 2
+    # Halved to hold activation memory flat at 2x the sequence length; the
+    # global batch (micro_batch * grad_accum = 32) is unchanged, so the loss
+    # curve is comparable to the 1024-ctx runs.
+    micro_batch_size: int = 8
+    grad_accum_steps: int = 4
     epochs: int = 1
     max_steps: int = 0             # 0 -> derive from epochs
+    # Examples drawn per epoch after task resampling. 0 -> the dataset default
+    # (sft.DEFAULT_EPOCH_EXAMPLES). This is the real length knob for an SFT
+    # run: max_steps only truncates, whereas this changes the mixture the LR
+    # schedule is fitted to.
+    mixture_examples: int = 0
 
     peak_lr: float = 1e-5
     min_lr_ratio: float = 0.1
@@ -201,12 +214,16 @@ class DPOConfig:
     """Direct preference optimisation against a frozen reference policy."""
 
     init_from: str = "artifacts/sft_model.pt"
-    seq_len: int = 1024
+    seq_len: int = 2048          # tracks sft.seq_len; DPO must see the same
+                                 # context the policy was fine-tuned in
 
-    micro_batch_size: int = 8
-    grad_accum_steps: int = 4
+    # DPO runs both branches of every pair through the model, so a micro-batch
+    # of N pairs is 2N sequences. Halved alongside the doubled context.
+    micro_batch_size: int = 4
+    grad_accum_steps: int = 8
     epochs: int = 1
     max_steps: int = 0
+    mixture_pairs: int = 0         # 0 -> dpo.DEFAULT_EPOCH_PAIRS
 
     # Sequence log-probs are averaged over reply tokens, not summed: a summed
     # logratio grows with reply length, which made the gradient blow past

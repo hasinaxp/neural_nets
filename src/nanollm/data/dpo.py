@@ -39,8 +39,20 @@ TASK_WEIGHTS = {
     "harmless": 0.20,
 }
 
+# Pairs per DPO epoch; see the note on sft.DEFAULT_EPOCH_EXAMPLES. 40k pairs
+# is ~1.25k optimizer steps at the default 4x8 batch. DPO is a short nudge off
+# the SFT policy, not a second fine-tune -- the reference model is what keeps
+# it honest, and more steps mostly buys reward hacking.
+DEFAULT_EPOCH_PAIRS = 40_000
+
 VAL_PER_TASK = 400
 MAX_TASK_REPEATS = 2
+# Per-task overrides, same idea as the SFT side. orca-dpo is ~13k rows before
+# the tie/rating filters take a bite, and at weight 0.30 it was setting the
+# size of the whole DPO run through the min() in _build_mixture.
+TASK_REPEAT_CAPS = {
+    "instruct": 3,
+}
 
 # Pairs whose two replies are near-identical teach nothing and dominate the
 # gradient with noise; pairs where the "rejected" reply is empty teach the model
@@ -146,7 +158,13 @@ def _from_messages_pair(row, rng):
     if not c or not r:
         return None
     prompt, chosen_text = c
-    _, rejected_text = r
+    prompt_r, rejected_text = r
+    # The two branches must agree on the context, the same check the hh
+    # normalizer makes. DPO compares two completions of one prompt; if the
+    # prompts differ, the logratio picks up that difference and the implicit
+    # reward is measuring the wrong thing.
+    if [m["content"] for m in prompt] != [m["content"] for m in prompt_r]:
+        return None
     return {"prompt": prompt, "chosen": chosen_text, "rejected": rejected_text}
 
 
@@ -372,26 +390,37 @@ def build_dpo_cache(force=False, val_per_task=VAL_PER_TASK):
             "actually wrote files and that each manifest entry has a `schema`.")
 
     # Sources without their own held-out files donate from train.
-    have_val_tasks = {r["task"] for r in val_rows}
+    #
+    # Keyed on (task, source), not task: keyed on task alone, one source that
+    # ships a published split suppresses the donation for every other source in
+    # that task, and the val curve then tracks a single corpus.
+    have_val = {(r["task"], r["source"]) for r in val_rows}
     rng.shuffle(train_rows)
-    by_task = {}
+    by_source = {}
     for r in train_rows:
-        by_task.setdefault(r["task"], []).append(r)
+        by_source.setdefault((r["task"], r["source"]), []).append(r)
     train_rows = []
-    for task, rows in by_task.items():
-        need = 0 if task in have_val_tasks else min(val_per_task, int(0.1 * len(rows)))
+    per_source_target = max(1, val_per_task // max(1, len(by_source)))
+    for pair, rows in by_source.items():
+        need = 0 if pair in have_val else min(per_source_target, int(0.1 * len(rows)))
         val_rows.extend(rows[:need])
         train_rows.extend(rows[need:])
 
-    # Trim oversized validation splits.
-    trimmed, counts = [], {}
+    # Trim oversized validation splits, capped per source as well as per task
+    # so one large published split cannot crowd out its task-mates.
+    val_sources = {(r["task"], r["source"]) for r in val_rows}
+    trimmed, counts, source_counts = [], {}, {}
     rng.shuffle(val_rows)
     for r in val_rows:
-        n = counts.get(r["task"], 0)
-        if n >= val_per_task:
+        pair = (r["task"], r["source"])
+        n_sources_in_task = max(1, sum(1 for t, _ in val_sources if t == r["task"]))
+        source_cap = max(1, val_per_task // n_sources_in_task)
+        if counts.get(r["task"], 0) >= val_per_task or \
+                source_counts.get(pair, 0) >= source_cap:
             train_rows.append(r)
             continue
-        counts[r["task"]] = n + 1
+        counts[r["task"]] = counts.get(r["task"], 0) + 1
+        source_counts[pair] = source_counts.get(pair, 0) + 1
         trimmed.append(r)
     val_rows = trimmed
 
@@ -455,31 +484,75 @@ class DPODataset(Dataset):
                   f"weight is redistributed across {list(present)}")
 
         norm = sum(present.values())
+        caps = {t: len(self._by_task[t]) * TASK_REPEAT_CAPS.get(t, MAX_TASK_REPEATS)
+                for t in present}
+
         if total_examples is None:
-            total_examples = int(min(
-                len(self._by_task[t]) * MAX_TASK_REPEATS / (w / norm)
-                for t, w in present.items()))
+            # Set directly, not derived: min() over tasks lets the smallest
+            # pool dictate the size of the entire run -- see the long note on
+            # SFTDataset._build_mixture.
+            total_examples = DEFAULT_EPOCH_PAIRS
+
+        want = self._allocate(present, caps, total_examples, norm)
 
         index = []
         self.mixture = {}
-        for task, weight in present.items():
-            want = int(total_examples * weight / norm)
+        for task in present:
+            n = want[task]
             pool = list(self._by_task[task])
-            if want <= len(pool):
-                picked = rng.sample(pool, want)
+            if n <= len(pool):
+                picked = rng.sample(pool, n)
             else:
-                reps = want // len(pool)
-                picked = pool * reps + rng.sample(pool, want - reps * len(pool))
+                reps = n // len(pool)
+                picked = pool * reps + rng.sample(pool, n - reps * len(pool))
             self.mixture[task] = {
                 "available": len(pool),
-                "used": want,
-                "repeats": round(want / max(1, len(pool)), 2),
+                "used": n,
+                "repeats": round(n / max(1, len(pool)), 2),
+                "target_share": round(present[task] / norm, 3),
+                "actual_share": 0.0,
+                "capped": n >= caps[task],
             }
             index.extend(picked)
 
+        realized = max(1, sum(want.values()))
+        for task in self.mixture:
+            self.mixture[task]["actual_share"] = round(want[task] / realized, 3)
+
+        # `epochs` here multiplies the index in place. The trainers pass 1 and
+        # loop epochs in the batch stream instead, so this is a no-op on the
+        # real path -- kept only so a caller building a dataset directly can
+        # still ask for a multi-epoch index.
         index = index * max(1, epochs)
         rng.shuffle(index)
         return index
+
+    @staticmethod
+    def _allocate(weights, caps, total, norm):
+        """Hand out ``total`` draws by weight, clipping each task at its cap.
+
+        Water-filling; identical in shape to SFTDataset._allocate.
+        """
+        alloc = {}
+        live = dict(weights)
+        remaining = total
+        while live:
+            live_norm = sum(live.values()) or 1.0
+            overflowed = [t for t, w in live.items()
+                          if remaining * w / live_norm > caps[t]]
+            if not overflowed:
+                for t, w in live.items():
+                    alloc[t] = int(remaining * w / live_norm)
+                break
+            for t in overflowed:
+                alloc[t] = int(caps[t])
+                remaining -= alloc[t]
+                del live[t]
+            if remaining <= 0:
+                for t in live:
+                    alloc[t] = 0
+                break
+        return alloc
 
     def describe(self):
         lines = [f"{self.split}: {len(self.index):,} pairs in "
@@ -487,8 +560,11 @@ class DPODataset(Dataset):
         for task in getattr(self, "missing_tasks", []):
             lines.append(f"  {task:12s} NO DATA -- weight redistributed")
         for task, info in getattr(self, "mixture", {}).items():
+            flag = "  CAPPED" if info.get("capped") else ""
             lines.append(f"  {task:12s} used {info['used']:>7,} of "
-                         f"{info['available']:>7,} ({info['repeats']}x)")
+                         f"{info['available']:>7,} ({info['repeats']}x) "
+                         f"| share {info.get('actual_share', 0):.3f} "
+                         f"target {info.get('target_share', 0):.3f}{flag}")
         return "\n".join(lines)
 
     def __len__(self):

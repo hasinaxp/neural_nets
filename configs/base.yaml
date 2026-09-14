@@ -1,4 +1,4 @@
-# Reference run: ~186M parameters, 6.3B tokens (~34 tok/param).
+# Reference run: ~186M parameters, 10.1B tokens (~54 tok/param).
 #
 # Sized for one 80GB A100 at micro_batch 16 x 2048 ctx. On smaller cards drop
 # micro_batch_size and raise grad_accum_steps by the same factor -- the global
@@ -30,7 +30,10 @@ data:
 optim:
   micro_batch_size: 16
   grad_accum_steps: 8       # global batch 128 seqs = 262k tokens/step
-  max_steps: 24000
+  # 38400 x 262,144 = 10.07B tokens. Well past Chinchilla-optimal for 186M
+  # params, which is the point: inference cost is fixed by the parameter count,
+  # so the extra tokens are the cheapest quality available at this size.
+  max_steps: 38400
   peak_lr: 5.0e-4
   min_lr_ratio: 0.1
   warmup_frac: 0.02
@@ -45,6 +48,16 @@ sft:
   # flat after epoch 1 (1.3986 -> 1.3968 over the last ~900 steps) while the
   # extra passes kept eroding general language modelling.
   epochs: 1
+  # 2048, matching the pretrained context. At 1024 the back half of the window
+  # never saw a chat template during fine-tuning, and long multi-turn examples
+  # were dropped at render time instead of being trimmed.
+  seq_len: 2048
+  micro_batch_size: 8       # global batch 32 examples, unchanged from 16x2
+  grad_accum_steps: 4
+  # Examples per epoch after task resampling; ~6.2k steps at 8x4. Every task
+  # fits under its repeat cap at this size, so the delivered mixture matches
+  # TASK_WEIGHTS exactly -- the trainer logs delivered vs target share.
+  mixture_examples: 200000
 
 dpo:
   # Per-token (length-normalised) logratios, so beta carries roughly the mean
@@ -53,6 +66,12 @@ dpo:
   length_normalize: true
   beta: 2.0
   peak_lr: 5.0e-6
+  seq_len: 2048             # must match sft.seq_len
+  # Both branches of every pair go through the model, so a micro-batch of N
+  # pairs is 2N sequences; halved alongside the doubled context.
+  micro_batch_size: 4
+  grad_accum_steps: 8
+  mixture_pairs: 40000      # ~1.25k steps; DPO is a nudge, not a second SFT
 
 runtime:
   out_dir: artifacts

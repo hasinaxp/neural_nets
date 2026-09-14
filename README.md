@@ -28,7 +28,7 @@ a small node.
 ```bash
 pip install -e ".[all]"
 
-python scripts/download_data.py pretrain --budget-gb 40   # raw corpus
+python scripts/download_data.py pretrain --budget-gb 70   # raw corpus
 python scripts/train_tokenizer.py --vocab-size 32768      # BPE, once
 python scripts/prepare_data.py --workers 16 --max-tokens 7_000_000_000
 
@@ -117,7 +117,8 @@ valid and usable.
 | tokens | shards on disk | enough for |
 |---|---|---|
 | 3.7B | 7.4 GB | Chinchilla-optimal (20 tok/param) |
-| 6.3B | 12.6 GB | the default 24k-step run |
+| 6.3B | 12.6 GB | a 24k-step run (34 tok/param) |
+| 10.1B | 20.1 GB | the default 38.4k-step run |
 | 11.8B | 23.6 GB | a 45k-step run (63 tok/param) |
 
 Budget separately for checkpoints: ~2.2GB each (weights + AdamW moments), plus
@@ -133,15 +134,29 @@ Single A100 80GB, `configs/base.yaml`, micro_batch 16 × 2048 ctx, bf16:
 | eager | 56.3k | 27.3% | 41.3 / 80 GB |
 
 Compile is worth 1.57× and costs a one-off ~90s warmup on the first step. At
-88.3k tok/s the full 6.3B-token run is about **20 hours on one A100**, or ~2.5
+88.3k tok/s the full 10.1B-token run is about **32 hours on one A100**, or ~4
 hours on 8.
 
 ## Token budget
 
-The default run is 24,000 steps × 262,144 tokens = **6.3B tokens**, about 34
+The default run is 38,400 steps × 262,144 tokens = **10.1B tokens**, about 54
 tokens per parameter. Chinchilla-optimal is ~20, and going past it is the right
 call for a model this small: inference cost dominates, so you buy quality with
 training tokens rather than parameters.
+
+The mix that feeds it, by share of the download budget:
+
+| source | share | what it is |
+|---|---|---|
+| fineweb-edu | 0.42 | classifier-filtered educational web text |
+| cosmopedia | 0.38 | synthetic textbooks and stories |
+| fineweb | 0.14 | general web crawl, for register diversity |
+| python-edu | 0.06 | deduplicated Python from GitHub |
+
+~70GB of raw parquet tokenises to roughly 10B tokens after the language filter
+and the short-document drop in `split_long_text`. Download less and the run
+simply wraps around the shards it has — which costs you a second epoch on part
+of the corpus, not a crash.
 
 Scale the batch to your GPU by trading `micro_batch_size` against
 `grad_accum_steps` — the product sets the global batch, so the loss curve is

@@ -337,7 +337,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             with sync_ctx:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=device.type == "cuda"):
-                    loss = model.calculate_loss(xs, ys) / cfg.optim.grad_accum_steps
+                    # Through train_model, not model: see Transformer.forward.
+                    loss = train_model(xs, targets=ys, mode="loss")                         / cfg.optim.grad_accum_steps
                 if scaler is not None:
                     scaler.scale(loss).backward()
                 else:

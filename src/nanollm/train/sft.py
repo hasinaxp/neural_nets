@@ -71,6 +71,12 @@ class ConversationStream:
         self.seed = seed
         self.dropped = 0
         self.rendered = 0
+        # Per-task, because a drop is not uniform across the mixture: it falls
+        # on whichever tasks have the longest prompts. Without this the
+        # delivered mixture can drift a long way from TASK_WEIGHTS with nothing
+        # in the logs to show it.
+        self.dropped_by_task: dict[str, int] = {}
+        self.rendered_by_task: dict[str, int] = {}
 
     def _examples(self) -> Iterator[dict]:
         order = list(range(len(self.dataset)))
@@ -86,11 +92,14 @@ class ConversationStream:
         for example in self._examples():
             ids, mask = render_conversation(
                 self.tokenizer, example["messages"], seq_len=self.seq_len)
+            task = example.get("task", "?")
             if ids is None or not any(mask):
                 self.dropped += 1
+                self.dropped_by_task[task] = self.dropped_by_task.get(task, 0) + 1
                 continue
             rows.append((ids, mask))
             self.rendered += 1
+            self.rendered_by_task[task] = self.rendered_by_task.get(task, 0) + 1
             if len(rows) == self.micro_batch_size:
                 yield pad_batch(rows, self.pad_id)
                 rows = []
@@ -137,7 +146,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     log.info("[3] Data")
     train_ds = SFTDataset(batch_size=cfg.sft.micro_batch_size, split="train",
-                          epochs=1, seed=cfg.data.seed)
+                          epochs=1, seed=cfg.data.seed,
+                          total_examples=cfg.sft.mixture_examples or None)
     val_ds = SFTDataset(batch_size=cfg.sft.micro_batch_size, split="val",
                         seed=cfg.data.seed)
     for line in train_ds.describe().splitlines():
@@ -275,7 +285,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             with sync_ctx:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=device.type == "cuda"):
-                    loss = model.calculate_loss(xs, ys) * weight / micro_per_step
+                    # Through train_model, not model: see Transformer.forward.
+                    loss = train_model(xs, targets=ys, mode="loss")                         * weight / micro_per_step
                 if scaler is not None:
                     scaler.scale(loss).backward()
                 else:
@@ -336,6 +347,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.info(f"Final val loss {last_val:.4f} | ppl {math.exp(min(20, last_val)):.2f}")
     log.info(f"    rendered {train_stream.rendered:,} conversations, "
              f"dropped {train_stream.dropped:,} (too long to fit)")
+    # Per task, because drops land on whichever tasks have the longest prompts
+    # and therefore silently reweight the mixture away from TASK_WEIGHTS.
+    for task in sorted(set(train_stream.rendered_by_task)
+                       | set(train_stream.dropped_by_task)):
+        kept = train_stream.rendered_by_task.get(task, 0)
+        lost = train_stream.dropped_by_task.get(task, 0)
+        if not lost:
+            continue
+        log.info(f"      {task:15s} kept {kept:>7,} dropped {lost:>6,} "
+                 f"({100 * lost / max(1, kept + lost):.1f}%)")
 
     if env.is_main:
         save_checkpoint(ckpt_path, model=model, optimizer=optimizer,

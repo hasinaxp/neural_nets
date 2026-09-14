@@ -5,7 +5,7 @@ old approach broke whenever a repo was re-sharded -- index 142 is a different
 file this month than it was last month -- and it copied every file a second
 time into ``dataset/raw`` instead of linking the hub cache.
 
-    python scripts/download_data.py pretrain --budget-gb 40
+    python scripts/download_data.py pretrain --budget-gb 70
 """
 
 from __future__ import annotations
@@ -26,18 +26,33 @@ class Source:
     # crawl, and cosmopedia's synthetic prose keeps the register varied.
     weight: float
     prefix: str = ""          # only take files under this path
+    # Column holding the document text. Everything web-derived calls it "text";
+    # the code corpora call it "content". ``sources.iter_parquet_documents``
+    # probes for it at read time, so this is documentation of what to expect
+    # rather than something the downloader has to act on.
+    text_column: str = "text"
     note: str = ""
 
 
+# Weights for the 10B-token run. Compared with the old 6.3B mix, cosmopedia
+# goes 0.30 -> 0.38 and a small python-edu slice is added, both paid for out of
+# raw fineweb (0.20 -> 0.14) and a trim of fineweb-edu (0.50 -> 0.42). More
+# synthetic textbook prose is the cheapest way to spend extra tokens on a model
+# this small; the code slice is kept deliberately thin -- enough for the model
+# to have seen indentation, def/return and docstrings, not enough to turn a
+# general LM into a weak code model.
 SOURCES: dict[str, Source] = {
     "fineweb-edu": Source(
-        "HuggingFaceFW/fineweb-edu", weight=0.50, prefix="sample/10BT",
+        "HuggingFaceFW/fineweb-edu", weight=0.42, prefix="sample/10BT",
         note="classifier-filtered educational web text"),
     "cosmopedia": Source(
-        "HuggingFaceTB/cosmopedia", weight=0.30,
+        "HuggingFaceTB/cosmopedia", weight=0.38,
         note="synthetic textbooks and stories"),
+    "python-edu": Source(
+        "codeparrot/codeparrot-clean", weight=0.06, text_column="content",
+        note="deduplicated Python from GitHub"),
     "fineweb": Source(
-        "HuggingFaceFW/fineweb", weight=0.20, prefix="sample/10BT",
+        "HuggingFaceFW/fineweb", weight=0.14, prefix="sample/10BT",
         note="general web crawl, for register diversity"),
 }
 
@@ -50,9 +65,42 @@ def _human(n: float) -> str:
     return f"{n:.1f}PB"
 
 
+def _interleave_by_subset(
+    entries: list[tuple[str, int]]
+) -> list[tuple[str, int]]:
+    """Round-robin the file list across its top-level subdirectories.
+
+    cosmopedia is laid out as data/auto_math_text/, data/khanacademy/,
+    data/openstax/, data/stories/, data/web_samples_v1/ and so on. Taking files
+    in sorted order until the budget runs out means a larger budget buys more
+    auto_math_text and never reaches stories or wikihow -- exactly the variety
+    the source is in the mix for. Cycling one file per subset at a time keeps
+    every subset represented at whatever budget is set. Sources that are a flat
+    list of files are unaffected.
+    """
+    from collections import OrderedDict
+
+    groups: "OrderedDict[str, list[tuple[str, int]]]" = OrderedDict()
+    for filename, size in entries:
+        head = filename.rsplit("/", 1)[0] if "/" in filename else ""
+        groups.setdefault(head, []).append((filename, size))
+
+    if len(groups) <= 1:
+        return entries
+
+    ordered: list[tuple[str, int]] = []
+    queues = list(groups.values())
+    while queues:
+        for queue in list(queues):
+            ordered.append(queue.pop(0))
+            if not queue:
+                queues.remove(queue)
+    return ordered
+
+
 def download_corpus(
     out_dir: str = "dataset/raw",
-    budget_gb: float = 40.0,
+    budget_gb: float = 70.0,
     sources: Optional[list[str]] = None,
     symlink: bool = True,
     log=print,
@@ -102,7 +150,7 @@ def download_corpus(
             continue
 
         taken, used = [], 0
-        for filename, size in entries:
+        for filename, size in _interleave_by_subset(entries):
             if size and used + size > share and taken:
                 break
             used += size
