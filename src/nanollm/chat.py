@@ -22,11 +22,14 @@ __all__ = ["SamplingParams", "ChatSession", "stream_reply"]
 
 @dataclass
 class SamplingParams:
-    temperature: float = 0.8
+    # See scripts/chat.py for why these are what they are: a 169M model loses
+    # facts to a hot tail long before a large one does, and a bare temperature
+    # cut trades that for repetition loops.
+    temperature: float = 0.5
     top_k: int = 50
     top_p: float = 0.95
-    min_p: float = 0.0
-    repetition_penalty: float = 1.1
+    min_p: float = 0.05
+    repetition_penalty: float = 1.15
     max_new_tokens: int = 256
 
     def describe(self) -> str:

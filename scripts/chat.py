@@ -12,6 +12,11 @@ Slash commands inside the session:
     /undo           drop the last exchange
     /history        print the conversation as the model sees it
     /tokens         show prompt length vs context
+    /think [on|off] ask for a "Thinking: ... / Answer: ..." scratchpad before
+                    the answer (toggles when given no argument). Trained on
+                    maths and multiple-choice reasoning, where the source data
+                    carries a real rationale -- elsewhere the model will
+                    usually just answer.
     /set k=v        change a sampling knob (temperature, top_k, top_p,
                     min_p, repetition_penalty, max_new_tokens)
     /params         show current sampling settings
@@ -29,6 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import torch
 
 from nanollm.chat import ChatSession, SamplingParams, stream_reply
+from nanollm.data.sft import ANSWER_PREFIX, THINK_PREFIX, THINK_PROMPTS
 from nanollm.config import TrainConfig, load_config
 from nanollm.model import Transformer
 from nanollm.tokenizer import Tokenizer
@@ -84,13 +90,25 @@ def main() -> int:
     p.add_argument("--prompt", default=None, help="send one message")
     p.add_argument("--once", action="store_true",
                    help="with --prompt, answer and exit")
-    p.add_argument("--temperature", type=float, default=0.8)
+    # Defaults tuned for a 169M model, which is far more sensitive to sampling
+    # temperature than a frontier one: at 0.8 this checkpoint answered "who
+    # wrote Pride and Prejudice" with "Elizabeth Taylor", and at greedy with
+    # "Jane Austen". The knowledge is there; a hot tail is what loses it.
+    #
+    # min_p rather than a lower temperature alone: cutting temperature on its
+    # own drives the model into repetition loops (at 0.3 it produced
+    # "Dear Mr./Ms./Mrs./Mr./..." until the token cap). min_p keeps the
+    # distribution sharp where the model is confident and still leaves a tail
+    # where it genuinely is not, and the repetition penalty covers the rest.
+    p.add_argument("--temperature", type=float, default=0.5)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--min-p", type=float, default=0.0)
-    p.add_argument("--repetition-penalty", type=float, default=1.1)
+    p.add_argument("--min-p", type=float, default=0.05)
+    p.add_argument("--repetition-penalty", type=float, default=1.15)
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--think", action="store_true",
+                   help="start with think mode on (see /think)")
     args = p.parse_args()
 
     path = pick_checkpoint(args.checkpoint)
@@ -121,6 +139,21 @@ def main() -> int:
         min_p=args.min_p, repetition_penalty=args.repetition_penalty,
         max_new_tokens=args.max_new_tokens)
     session = ChatSession(tokenizer=tokenizer, n_seq=cfg.model.n_seq)
+    think_mode = args.think
+
+    # SFT teaches a plain-text scratchpad -- "Thinking: ...\nAnswer: ..." --
+    # because the tokenizer's six special tokens are fixed by the pretrained
+    # checkpoint and a seventh would invalidate every merge id. Dim the working
+    # so the answer is what stands out, but never hide it: the whole reason to
+    # show reasoning from a model this small is so a reader can see when it is
+    # nonsense.
+    DIM, RESET = "\033[2m", "\033[0m"
+
+    def ask(text: str) -> str:
+        """Prefix a think instruction when think mode is on."""
+        if not think_mode:
+            return text
+        return f"{THINK_PROMPTS[0]}\n\n{text}"
 
     def respond() -> str:
         prompt_ids, dropped = session.build_prompt(params.max_new_tokens)
@@ -129,19 +162,34 @@ def main() -> int:
                   f"{cfg.model.n_seq}-token context]")
         print("assistant: ", end="", flush=True)
         pieces = []
+        dimmed = False
         try:
             for delta in stream_reply(model, tokenizer, prompt_ids, params,
                                       device, amp_dtype):
                 pieces.append(delta)
+                # Decide on the text so far, not on this fragment: the prefixes
+                # are several tokens long and arrive split across deltas.
+                so_far = "".join(pieces)
+                inside = (THINK_PREFIX in so_far
+                          and ANSWER_PREFIX not in so_far)
+                if inside and not dimmed:
+                    print(DIM, end="", flush=True)
+                    dimmed = True
+                elif dimmed and not inside:
+                    print(RESET, end="", flush=True)
+                    dimmed = False
                 print(delta, end="", flush=True)
         except KeyboardInterrupt:
             print("  [interrupted]", end="")
+        finally:
+            if dimmed:
+                print(RESET, end="", flush=True)
         print()
         return "".join(pieces)
 
     # -- one-shot ----------------------------------------------------------
     if args.prompt and args.once:
-        session.add_user(args.prompt)
+        session.add_user(ask(args.prompt))
         respond()
         return 0
 
@@ -153,7 +201,7 @@ def main() -> int:
     print("/help for commands, /exit to quit.\n")
 
     if args.prompt:
-        session.add_user(args.prompt)
+        session.add_user(ask(args.prompt))
         print(f"you: {args.prompt}")
         session.add_assistant(respond())
 
@@ -189,7 +237,7 @@ def main() -> int:
                     continue
                 last_user = [m for m in session.messages if m["role"] == "user"][-1]
                 session.undo()
-                session.add_user(last_user["content"])
+                session.add_user(last_user["content"])   # already prefixed
                 session.add_assistant(respond())
                 continue
             if command == "history":
@@ -203,6 +251,16 @@ def main() -> int:
                 print(f"[prompt {len(ids)} tokens of {cfg.model.n_seq} "
                       f"| reply budget {params.max_new_tokens} "
                       f"| {dropped} turn(s) dropped]")
+                continue
+            if command == "think":
+                if rest in ("on", "off"):
+                    think_mode = rest == "on"
+                elif not rest:
+                    think_mode = not think_mode
+                else:
+                    print("[usage: /think [on|off]]")
+                    continue
+                print(f"[think mode {'on' if think_mode else 'off'}]")
                 continue
             if command == "params":
                 print(f"[{params.describe()}]")
@@ -224,7 +282,7 @@ def main() -> int:
             print(f"[unknown command /{command}; try /help]")
             continue
 
-        session.add_user(line)
+        session.add_user(ask(line))
         session.add_assistant(respond())
 
     print("bye.")

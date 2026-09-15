@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -15,6 +16,7 @@ from ..tokenizer import Tokenizer
 __all__ = [
     "configure_backends", "load_tokenizer", "build_optimizer", "clip_and_step",
     "load_pretrained", "pad_batch", "peak_flops", "resolve_amp_dtype",
+    "LossWeighting",
 ]
 
 # Dense bf16 peak, FLOP/s, for the MFU denominator. Unknown cards report 0 and
@@ -164,22 +166,79 @@ def load_pretrained(model: Transformer, path: str, device, log,
     return blob if isinstance(blob, dict) else {}
 
 
+@dataclass
+class LossWeighting:
+    """Per-token weights for the SFT cross entropy.
+
+    Two independent corrections, both of which exist because the plain token
+    mean spends the gradient somewhere other than where the mixture says.
+
+    ``eos_share`` -- the end-of-reply token is one token out of however many the
+    reply has, so a 6-token QA answer trains stopping ~25x harder than a
+    155-token draft. Measured on a finished run, P(EOS) at the correct stopping
+    position fell from 0.84 on replies of 1-16 tokens to 0.55 past 257, and the
+    tasks that ramble (writing 0.39, instruct 0.43, chat 0.61) are exactly the
+    long-reply ones. This pins EOS at a floor share of each example's loss mass:
+    for a reply of L supervised tokens the weight solving w/((L-1)+w) = share,
+    clamped so short replies -- already at P(EOS) ~0.99 -- are never touched and
+    a very long one cannot hand a single position an unbounded weight.
+
+    ``per_example`` -- the token mean weights an example by its reply length, so
+    TASK_WEIGHTS describes the share of *examples* while the gradient follows
+    the share of *tokens*. At the configured mixture that gives chat 78% of the
+    gradient against its nominal 24%, and extractive_qa 0.4% against 12%.
+    Normalising each example to a fixed mass makes the delivered gradient match
+    the mixture that was actually designed.
+    """
+
+    eos_id: Optional[int] = None
+    eos_share: float = 0.0
+    eos_cap: float = 12.0
+    per_example: bool = False
+
+    @property
+    def active(self) -> bool:
+        return (self.eos_share > 0 and self.eos_id is not None) or self.per_example
+
+    def row_weights(self, ids: list[int], mask: list[int]) -> list[float]:
+        """Weight per position, aligned with ``ids`` (so it shifts like targets)."""
+        w = [1.0 if m else 0.0 for m in mask]
+        supervised = sum(mask)
+        if (self.eos_share > 0 and self.eos_id is not None and supervised > 1
+                and ids[-1] == self.eos_id and mask[-1]):
+            target = self.eos_share * (supervised - 1) / (1.0 - self.eos_share)
+            # Never below 1.0: short replies already stop reliably and pushing
+            # them further only trades answer length for a stop token.
+            w[-1] = min(self.eos_cap, max(1.0, target))
+        if self.per_example:
+            total = sum(w)
+            if total > 0:
+                w = [x / total for x in w]
+        return w
+
+
 def pad_batch(rows: list[tuple[list[int], list[int]]], pad_id: int,
-              device=None) -> tuple[torch.Tensor, torch.Tensor]:
+              device=None, weighting: Optional[LossWeighting] = None):
     """Pad (ids, loss_mask) rows to the batch's longest sequence.
 
     Returns (xs, ys) already shifted for next-token prediction, with
     non-target positions set to IGNORE_INDEX so they contribute no loss.
     Padding to the longest row in the batch rather than to seq_len keeps the
     step cost proportional to the actual content.
+
+    With an active ``weighting`` the return is (xs, ys, ws), where ws is the
+    per-token multiplier to hand to ``Transformer.calculate_loss``. Without one
+    the return stays a 2-tuple and nothing about the loss changes.
     """
     if not rows:
         raise ValueError("empty batch")
     width = max(len(ids) for ids, _ in rows)
     n = len(rows)
+    weighted = weighting is not None and weighting.active
 
     tokens = torch.full((n, width), pad_id, dtype=torch.long)
     targets = torch.full((n, width), IGNORE_INDEX, dtype=torch.long)
+    weights = torch.zeros((n, width), dtype=torch.float) if weighted else None
     for i, (ids, mask) in enumerate(rows):
         length = len(ids)
         tokens[i, :length] = torch.tensor(ids, dtype=torch.long)
@@ -187,9 +246,17 @@ def pad_batch(rows: list[tuple[list[int], list[int]]], pad_id: int,
         row = torch.tensor(ids, dtype=torch.long)
         targets[i, :length] = torch.where(
             keep, row, torch.full_like(row, IGNORE_INDEX))
+        if weighted:
+            weights[i, :length] = torch.tensor(
+                weighting.row_weights(ids, mask), dtype=torch.float)
 
     xs = tokens[:, :-1].contiguous()
     ys = targets[:, 1:].contiguous()      # predict position t+1 from t
     if device is not None:
         xs, ys = xs.to(device, non_blocking=True), ys.to(device, non_blocking=True)
-    return xs, ys
+    if not weighted:
+        return xs, ys
+    ws = weights[:, 1:].contiguous()
+    if device is not None:
+        ws = ws.to(device, non_blocking=True)
+    return xs, ys, ws

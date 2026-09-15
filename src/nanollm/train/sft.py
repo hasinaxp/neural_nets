@@ -34,8 +34,9 @@ from ..utils.distributed import (all_reduce_mean, cleanup_distributed,
                                  setup_distributed)
 from ..utils.logging import MetricLogger, run_id, setup_logging
 from ..utils.schedules import make_lr_fn
-from .common import (build_optimizer, clip_and_step, configure_backends,
-                     load_pretrained, load_tokenizer, pad_batch, peak_flops)
+from .common import (LossWeighting, build_optimizer, clip_and_step,
+                     configure_backends, load_pretrained, load_tokenizer,
+                     pad_batch, peak_flops)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -59,7 +60,11 @@ class ConversationStream:
 
     def __init__(self, dataset: SFTDataset, tokenizer, seq_len: int,
                  micro_batch_size: int, pad_id: int, rank: int = 0,
-                 world_size: int = 1, epochs: int = 1, seed: int = 1337):
+                 world_size: int = 1, epochs: int = 1, seed: int = 1337,
+                 weighting: Optional[LossWeighting] = None):
+        # None on the validation streams: val is always scored with the plain
+        # token mean, so the curve stays comparable across weighting settings.
+        self.weighting = weighting
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -101,10 +106,10 @@ class ConversationStream:
             self.rendered += 1
             self.rendered_by_task[task] = self.rendered_by_task.get(task, 0) + 1
             if len(rows) == self.micro_batch_size:
-                yield pad_batch(rows, self.pad_id)
+                yield pad_batch(rows, self.pad_id, weighting=self.weighting)
                 rows = []
         if rows:
-            yield pad_batch(rows, self.pad_id)
+            yield pad_batch(rows, self.pad_id, weighting=self.weighting)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -147,16 +152,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.info("[3] Data")
     train_ds = SFTDataset(batch_size=cfg.sft.micro_batch_size, split="train",
                           epochs=1, seed=cfg.data.seed,
-                          total_examples=cfg.sft.mixture_examples or None)
+                          total_examples=cfg.sft.mixture_examples or None,
+                          cache_dir=cfg.data.sft_cache_dir)
     val_ds = SFTDataset(batch_size=cfg.sft.micro_batch_size, split="val",
-                        seed=cfg.data.seed)
+                        seed=cfg.data.seed,
+                        cache_dir=cfg.data.sft_cache_dir)
     for line in train_ds.describe().splitlines():
         log.info(f"    {line}")
+
+    # Training-only loss weighting. Validation below deliberately gets none, so
+    # the val curve measures the same quantity regardless of how the gradient
+    # is apportioned here.
+    weighting = LossWeighting(
+        eos_id=eos_id,
+        eos_share=cfg.sft.eos_loss_share,
+        eos_cap=cfg.sft.eos_loss_cap,
+        per_example=cfg.sft.loss_normalize == "example")
+    if cfg.sft.loss_normalize not in ("token", "example"):
+        raise ValueError(f"sft.loss_normalize must be 'token' or 'example', "
+                         f"got {cfg.sft.loss_normalize!r}")
+    if weighting.active:
+        bits = []
+        if weighting.eos_share > 0:
+            bits.append(f"EOS floor share {weighting.eos_share:.0%} "
+                        f"(cap {weighting.eos_cap:g}x)")
+        if weighting.per_example:
+            bits.append("per-example normalisation")
+        log.info(f"    loss weighting: {', '.join(bits)}")
+    else:
+        log.info("    loss weighting: none (plain token mean)")
 
     train_stream = ConversationStream(
         train_ds, tokenizer, cfg.sft.seq_len, cfg.sft.micro_batch_size, pad_id,
         rank=env.rank, world_size=env.world_size, epochs=cfg.sft.epochs,
-        seed=cfg.data.seed)
+        seed=cfg.data.seed, weighting=weighting)
     val_stream = ConversationStream(
         val_ds, tokenizer, cfg.sft.seq_len, cfg.sft.micro_batch_size, pad_id,
         epochs=1, seed=cfg.data.seed)
@@ -167,6 +196,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         if len(val_batches) >= cfg.sft.val_batches:
             break
     log.info(f"    {len(val_batches)} fixed validation batches")
+
+    # Per-task validation. The aggregate curve above is a weighted average over
+    # ten tasks, so a task that is not learning at all can be hidden by the rest
+    # -- and the tasks most likely to be in that position are the small new ones
+    # (shell, rewrite, writing), which is exactly what we need to see. Held as a
+    # fixed set of batches per task, built once, same as the aggregate.
+    val_task_batches: dict[str, list] = {}
+    if cfg.sft.val_task_batches > 0:
+        for task in sorted(val_ds.tasks):
+            view = val_ds.subset(task)
+            if view is None:
+                continue
+            stream = ConversationStream(
+                view, tokenizer, cfg.sft.seq_len, cfg.sft.micro_batch_size,
+                pad_id, epochs=1, seed=cfg.data.seed)
+            batches = []
+            for batch in stream:
+                batches.append((batch[0].to(device), batch[1].to(device)))
+                if len(batches) >= cfg.sft.val_task_batches:
+                    break
+            if batches:
+                val_task_batches[task] = batches
+        if val_task_batches:
+            log.info(f"    per-task validation: "
+                     + ", ".join(f"{t} x{len(b)}"
+                                 for t, b in sorted(val_task_batches.items())))
 
     # -- pretraining replay -------------------------------------------------
     replay_iter = None
@@ -226,15 +281,30 @@ def main(argv: Optional[list[str]] = None) -> int:
                           gradient_as_bucket_view=True)
 
     @torch.no_grad()
-    def evaluate() -> float:
-        train_model.eval()
+    def _mean_loss(batches) -> float:
         total = torch.zeros((), device=device)
-        for xs, ys in val_batches:
+        for xs, ys in batches:
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=device.type == "cuda"):
                 total += model.calculate_loss(xs, ys).detach()
+        return float(all_reduce_mean(total / max(1, len(batches)), env).item())
+
+    @torch.no_grad()
+    def evaluate() -> float:
+        train_model.eval()
+        loss = _mean_loss(val_batches)
         train_model.train()
-        return float(all_reduce_mean(total / max(1, len(val_batches)), env).item())
+        return loss
+
+    @torch.no_grad()
+    def evaluate_by_task() -> dict:
+        if not val_task_batches:
+            return {}
+        train_model.eval()
+        losses = {task: _mean_loss(batches)
+                  for task, batches in sorted(val_task_batches.items())}
+        train_model.train()
+        return losses
 
     log.info("[4] Training")
     train_model.train()
@@ -264,9 +334,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
 
     try:
-        for xs, ys in train_stream:
+        for batch in train_stream:
             if global_step >= max_steps:
                 break
+            xs, ys = batch[0], batch[1]
+            ws = batch[2] if len(batch) > 2 else None
 
             use_replay = (replay_iter is not None
                           and replay_rng.random() < cfg.sft.replay_frac)
@@ -274,9 +346,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             if use_replay:
                 rx, ry = next(replay_iter)
                 xs, ys = rx.to(device, non_blocking=True), ry.to(device, non_blocking=True)
+                # Replay is plain next-token text: every token counts once,
+                # which is the objective it is there to preserve. Passed as an
+                # explicit ones tensor rather than None so the compiled
+                # calculate_loss sees one argument signature instead of
+                # alternating None/tensor every few micro-batches and holding a
+                # second graph for it.
+                ws = torch.ones_like(ys, dtype=torch.float) if weighting.active else None
                 n_replay += 1
             else:
                 xs, ys = xs.to(device, non_blocking=True), ys.to(device, non_blocking=True)
+                if ws is not None:
+                    ws = ws.to(device, non_blocking=True)
 
             is_last_micro = (accum_micro + 1) == micro_per_step
             sync_ctx = (train_model.no_sync()
@@ -286,7 +367,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=device.type == "cuda"):
                     # Through train_model, not model: see Transformer.forward.
-                    loss = train_model(xs, targets=ys, mode="loss")                         * weight / micro_per_step
+                    loss = train_model(xs, targets=ys, mode="loss",
+                                       loss_weights=ws) * weight / micro_per_step
                 if scaler is not None:
                     scaler.scale(loss).backward()
                 else:
@@ -328,6 +410,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 metrics.log_val(global_step, last_val)
                 log.info(f"    >> val loss {last_val:.4f} | "
                          f"ppl {math.exp(min(20, last_val)):.2f}")
+                per_task = evaluate_by_task()
+                if per_task:
+                    log.info("       " + "  ".join(
+                        f"{task}={loss:.3f}" for task, loss in per_task.items()))
+                    for task, loss in per_task.items():
+                        metrics.history.setdefault(
+                            f"val_loss_{task}", []).append(loss)
 
             if global_step % cfg.runtime.ckpt_every == 0 and env.is_main:
                 save_checkpoint(ckpt_path, model=model, optimizer=optimizer,
@@ -345,6 +434,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     last_val = evaluate()
     metrics.log_val(global_step, last_val)
     log.info(f"Final val loss {last_val:.4f} | ppl {math.exp(min(20, last_val)):.2f}")
+    for task, loss in evaluate_by_task().items():
+        log.info(f"      {task:15s} val loss {loss:.4f} | "
+                 f"ppl {math.exp(min(20, loss)):.2f}")
     log.info(f"    rendered {train_stream.rendered:,} conversations, "
              f"dropped {train_stream.dropped:,} (too long to fit)")
     # Per task, because drops land on whichever tasks have the longest prompts

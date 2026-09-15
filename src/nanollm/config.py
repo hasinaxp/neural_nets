@@ -167,6 +167,10 @@ class DataConfig:
     data_dir: str = "dataset/tokens"
     tokenizer_file: str = "artifacts/tokenizer-32768.txt"
     raw_dir: str = "dataset/raw"
+    # Where build_sft_cache() writes its normalised parquet. Configurable so a
+    # run can be pointed at an alternative mixture (or a test at a throwaway
+    # one) without editing module constants.
+    sft_cache_dir: str = "dataset/sft/cache"
 
     # Fraction of shards held out for validation. Held-out shards are never
     # touched by the training sampler.
@@ -252,6 +256,30 @@ class SFTConfig:
     weight_decay: float = 0.0
     grad_clip: float = 1.0
 
+    # -- loss weighting ------------------------------------------------------
+    # The plain token mean does not spend the gradient where the mixture says
+    # it should. Both knobs below are measured corrections; see LossWeighting
+    # in nanollm.train.common for the numbers behind them. Validation is always
+    # scored unweighted, so val loss stays comparable across these settings.
+    #
+    # Share of each example's loss mass pinned on its closing EOS. One token in
+    # a 155-token reply is 0.6% of that example's gradient, which is why long
+    # replies stop badly (P(EOS) 0.55 past 257 tokens vs 0.84 under 16) and the
+    # model runs to the length cap instead of ending. Only ever an upweight:
+    # short replies already stop at ~0.99 and are left alone. 0 disables.
+    eos_loss_share: float = 0.02
+    # Ceiling on that weight, so a 600-token chat reply cannot hand one
+    # position an unbounded share and turn the model trigger-happy about
+    # stopping early.
+    eos_loss_cap: float = 12.0
+    # "token": the historical behaviour -- every supervised token counts once,
+    # so an example's pull scales with its reply length and TASK_WEIGHTS ends
+    # up describing the example mix while the gradient follows the token mix
+    # (chat 78% of the gradient against a nominal 24%; extractive_qa 0.4%
+    # against 12%). "example": normalise each example to equal mass, so the
+    # delivered gradient matches the mixture that was actually designed.
+    loss_normalize: str = "token"
+
     # Pretraining replay (rehearsal). SFT's objective is narrow -- loss on
     # assistant tokens over a handful of task formats -- and nothing in it asks
     # the model to keep modelling ordinary text, so it drifts. Mixing plain
@@ -263,6 +291,12 @@ class SFTConfig:
 
     val_every: int = 250
     val_batches: int = 40
+    # Batches of held-out data evaluated *per task*, on top of the aggregate
+    # above. The aggregate is a weighted average over ten tasks, so a task that
+    # never learns can sit inside a perfectly healthy-looking curve; the small
+    # ones (shell, rewrite, writing) are the likeliest to be in that position
+    # and the ones the mixture would need retuning for. 0 disables.
+    val_task_batches: int = 4
 
 
 @dataclass

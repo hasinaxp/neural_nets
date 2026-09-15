@@ -1,10 +1,44 @@
-# Reference run: ~169M parameters, 16 unique layers executed 24 times,
-# 10.1B tokens (~60 tok/param).
+# Mid-training (annealing) on curated textbook prose.
 #
-# Sized for one RTX PRO 6000 Blackwell (96GB) at micro_batch 32 x 2048 ctx:
-# ~65GB peak, ~95k tok/s compiled, so the 10.1B-token budget lands in ~30h.
-# On smaller cards drop micro_batch_size and raise grad_accum_steps by the same
-# factor -- the global batch, and therefore the loss curve, is unchanged.
+# Same model, same tokenizer, same loader -- only the corpus and the LR differ.
+# Run it AFTER pretraining, initialised from the pretrained checkpoint:
+#
+#   python scripts/download_midtrain.py
+#   python scripts/prepare_data.py --raw-dir dataset/raw_midtrain \
+#       --out-dir dataset/tokens_midtrain --no-wikipedia
+#   python -m nanollm.train.pretrain --config configs/midtrain.yaml \
+#       --init-from artifacts/pretrain_checkpoint_latest.pt
+#
+# Then point SFT at the annealed checkpoint:
+#   python -m nanollm.train.sft --config configs/base.yaml \
+#       --init-from artifacts/midtrain/pretrain_model.pt
+#
+# peak_lr is 3e-5, ~6% of the pretraining peak and well under the 5e-5 the
+# cosine ended at. Higher and the stage stops being a nudge toward textbook
+# register and starts being a second pretraining run on 200x less data, which
+# overfits a 169M model to 76 books very quickly.
+#
+# max_steps 400 x 262,144 = 105M tokens. The cleaned corpus measures ~46.5M
+# tokens (openstax 37.0M, libretexts-chem 6.9M, ncert 2.6M), so that is ~2.2
+# epochs -- about the ceiling before a model this small starts reciting the
+# books rather than learning from them. If you add sources, scale max_steps to
+# keep it near two epochs rather than leaving it where it is.
+#
+# IMPORTANT -- mix the original shards back in. Pure textbook for two epochs at
+# this LR drifts the model off general text the same way pure SFT does, and the
+# pretrain loop has no replay knob, so the rehearsal has to be in the data:
+#
+#   python scripts/mix_shards.py --into dataset/tokens_midtrain \
+#       --from dataset/tokens --shards 2
+#
+# That links (does not copy) two 100M-token shards in beside the ~46M-token
+# textbook set and rewrites index.json, so the textbooks are ~19% of the stage.
+#
+# Because mix_shards appends and val_shards takes the LAST shard, validation
+# then runs on original pretraining data rather than on the textbooks -- which
+# is the number you actually want to watch here. It answers "am I damaging
+# general text?", not "am I fitting the books?". If it climbs more than ~0.05
+# the stage has gone too far; stop and lower peak_lr or max_steps.
 
 model:
   vocab_size: 32768
@@ -37,12 +71,7 @@ model:
   activation_checkpointing: false
 
 data:
-  data_dir: dataset/tokens
-  # v3: `find` thinned out of the shell task and the smalltalk task added.
-  # Rebuild with: python -c "import sys;sys.path.insert(0,'src');\
-  #   from nanollm.data.sft import build_sft_cache;\
-  #   build_sft_cache(force=True, cache_dir='dataset/sft/cache_v3')"
-  sft_cache_dir: dataset/sft/cache_v3
+  data_dir: dataset/tokens_midtrain
   tokenizer_file: artifacts/tokenizer-32768.txt
   raw_dir: dataset/raw
   val_shards: 1
@@ -67,10 +96,10 @@ optim:
   # so the extra tokens are the cheapest quality available at this size. The
   # looped layers do not change that -- they cost FLOPs at inference, not
   # memory, so the budget is still worth spending.
-  max_steps: 38400
-  peak_lr: 5.0e-4
+  max_steps: 400
+  peak_lr: 3.0e-5
   min_lr_ratio: 0.1
-  warmup_frac: 0.02
+  warmup_frac: 0.05
   schedule: cosine
   weight_decay: 0.1
   beta1: 0.9
@@ -78,31 +107,6 @@ optim:
   grad_clip: 1.0
 
 sft:
-  # Measured against the previous 1e-5 run, same data, same seed: every one of
-  # the ten tasks improved and the mean val loss went 1.4534 -> 1.3812. The
-  # old rate was chosen to avoid the damage a 3e-5 x 3-epoch run did, but that
-  # run's problem was the epochs -- at one epoch there is no overfitting signal
-  # at all (train loss never drops below val), so 1e-5 was leaving capacity
-  # unspent. Forgetting stays bounded: held-out pretraining perplexity moves
-  # 15.58 -> 15.91.
-  peak_lr: 2.0e-5
-
-  # Share of each example's loss mass pinned on its closing EOS; see
-  # SFTConfig.eos_loss_share. Measured effect, same run: P(EOS) at the correct
-  # stopping position on replies over 257 tokens went 0.555 -> 0.891, while
-  # replies under 16 tokens were left alone (0.841 -> 0.847) exactly as the
-  # max(1.0, ...) floor intends. This is what stops long answers running to the
-  # token cap instead of ending.
-  eos_loss_share: 0.02
-  eos_loss_cap: 12.0
-
-  # "token" reproduces the historical behaviour. "example" makes the delivered
-  # gradient match TASK_WEIGHTS instead of following reply length -- see the
-  # note on SFTConfig.loss_normalize for the 78%-vs-24% figure. Left at "token"
-  # because it is a large change to what the run optimises and it has not been
-  # measured here; switch it to run the comparison.
-  loss_normalize: token
-
   # One pass over the instruction data. Earlier 3-epoch runs showed val loss
   # flat after epoch 1 (1.3986 -> 1.3968 over the last ~900 steps) while the
   # extra passes kept eroding general language modelling.
@@ -147,7 +151,7 @@ dpo:
   mixture_pairs: 40000      # ~1.25k steps; DPO is a nudge, not a second SFT
 
 runtime:
-  out_dir: artifacts
+  out_dir: artifacts/midtrain
   log_dir: logs
   # compile is worth more here than any batch-size choice: eager tops out at
   # ~54k tok/s, compiled default reaches ~94k, and max-autotune-no-cudagraphs
@@ -165,10 +169,10 @@ runtime:
   sample_every: 1000
   # ~0.69s/step, so this is a checkpoint every ~11 min; a crash costs that
   # much work and no more. Each write is ~2GB (fp32 weights + Adam moments).
-  ckpt_every: 1000
+  ckpt_every: 100
   # 4 permanent snapshots, not 8: /home has ~55GB free and the 10B-token shard
   # set will want ~20GB of it.
-  snapshot_every: 9600
+  snapshot_every: 200
   plot_every: 200
   tensorboard: false
   wandb: false

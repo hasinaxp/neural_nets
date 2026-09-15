@@ -41,6 +41,7 @@ from ..utils.distributed import (all_reduce_mean, cleanup_distributed,
 from ..utils.logging import MetricLogger, run_id, setup_logging
 from ..utils.schedules import make_lr_fn
 from .common import (build_optimizer, clip_and_step, configure_backends,
+                     load_pretrained,
                      load_tokenizer, peak_flops)
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -51,6 +52,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--set", dest="overrides", action="append", default=[],
                    metavar="KEY=VALUE",
                    help="override a config field, e.g. --set optim.peak_lr=3e-4")
+    p.add_argument("--init-from", default=None,
+                   help="load weights from a checkpoint and start a NEW run at "
+                        "step 0 (mid-training / annealing). Unlike --resume "
+                        "this restores no optimizer state and no step count.")
     p.add_argument("--resume", default=None,
                    help="'auto' (default), 'never', or a checkpoint path")
     p.add_argument("--max-steps", type=int, default=None,
@@ -97,6 +102,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg.optim.max_steps = args.max_steps
     if args.resume is not None:
         cfg.runtime.resume = args.resume
+    if args.init_from:
+        # A fresh stage, not a continuation: never silently resume on top of it.
+        cfg.runtime.resume = "never"
     if args.dry_run:
         cfg.optim.max_steps = 3
         cfg.runtime.compile = False
@@ -196,6 +204,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.warning(f"    {e}; starting fresh at step 0")
         except Exception as e:
             log.warning(f"    could not load {resume_from}: {e}; starting fresh")
+    elif args.init_from:
+        # Mid-training: weights only, step 0, a fresh LR schedule. The optimizer
+        # deliberately starts cold -- the moments from the end of a 38k-step
+        # cosine describe a different objective and a much larger LR.
+        load_pretrained(model, args.init_from, device, log)
+        log.info("    mid-training: starting a new schedule at step 0")
     else:
         log.info("    no checkpoint to resume; starting at step 0")
 

@@ -1,8 +1,10 @@
+import copy
 import json
 import math
 import os
 import random
 import re
+from collections import Counter
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -22,18 +24,44 @@ SEED = 1337
 # Share of the training mixture per task. Raw row counts are wildly unbalanced
 # (SQL alone is ~185k rows), so the index is resampled to hit these instead.
 #
-# SQL is down from 0.16 to 0.10: it is the narrowest, most formulaic task here
-# and the least useful to a general-purpose assistant per token spent. That
-# 0.06 goes to chat, which is what a general model is actually judged on and
-# which has by far the deepest pool.
+# Rebalanced for "most useful general assistant per token". Three tasks are new
+# -- writing, rewrite, shell -- and the room for them comes from the two that
+# were paying the least rent:
+#
+#   sql        0.10 -> 0.04   the narrowest, most formulaic task here. A model
+#                             this size is not going to be anyone's text-to-SQL
+#                             engine, and every point of weight spent on it was
+#                             a point not spent on things people actually ask a
+#                             small assistant to do.
+#   chat       0.32 -> 0.24   still the largest single task, but a chunk of what
+#                             made it large was no_robots Generation rows that
+#                             are now correctly labelled `writing`. This is a
+#                             relabelling as much as a cut.
+#   instruct   0.08 -> 0.04   dolly's best rows (creative_writing, brainstorming)
+#                             moved to `writing`; what is left is the residual.
+#
+# The three additions are the common asks this model could not previously do:
+#   writing    drafting -- emails, posts, blurbs, brainstorms
+#   rewrite    rephrase, simplify, fix grammar, change tone
+#   shell      natural language -> a Linux command
 TASK_WEIGHTS = {
-    "chat": 0.32,
-    "extractive_qa": 0.16,
-    "summarization": 0.12,
-    "math": 0.12,
-    "sql": 0.10,
-    "reasoning": 0.10,
-    "instruct": 0.08,
+    # A bare "hi" is the first thing anyone types and the mixture could not
+    # answer it -- see the Small talk section for why 1,872 real greeting rows
+    # amounted to ~0.04% of an epoch's gradient. 0.03 is deliberately small:
+    # this is a handful of short behaviours that need to exist at all, not a
+    # capability that rewards more weight, and the replies are short enough
+    # that it costs almost nothing in tokens.
+    "smalltalk": 0.03,
+    "chat": 0.21,
+    "extractive_qa": 0.12,
+    "writing": 0.12,
+    "rewrite": 0.10,
+    "math": 0.10,
+    "summarization": 0.09,
+    "shell": 0.08,
+    "reasoning": 0.07,
+    "instruct": 0.04,
+    "sql": 0.04,
 }
 
 # Examples per SFT epoch. Set explicitly rather than derived, because every
@@ -43,9 +71,11 @@ TASK_WEIGHTS = {
 # runs for 50k steps and squeezes the small tasks down to ~2% share.
 #
 # 200k examples is ~6.2k optimizer steps at the default 8x4 batch, and at this
-# size every task in TASK_WEIGHTS fits under its repeat cap, so the delivered
-# mixture matches the target shares exactly. Raise it and the small tasks cap
-# out first; describe() prints the drift when that happens.
+# size every task in TASK_WEIGHTS is delivered at exactly its target share.
+# The binding task is now `writing` (~13k rows at a 2x repeat cap, so 26.6k
+# available against 24k drawn); past ~220k it caps and its share starts to
+# slip. describe() prints delivered vs target so that is visible rather than
+# silent.
 DEFAULT_EPOCH_EXAMPLES = 200_000
 
 VAL_PER_TASK = 300          # held-out examples per (task, source)
@@ -53,10 +83,34 @@ MAX_TASK_REPEATS = 3        # default cap on oversampling within one epoch
 # Per-task overrides. Small pools that would otherwise be repeated hard are
 # held down; deep, diverse pools are allowed a little more headroom.
 TASK_REPEAT_CAPS = {
-    "reasoning": 2,         # ~13k rows of short MCQ; memorised fast
+    "smalltalk": 4,         # a few thousand short rows; the behaviour is tiny
+                            # and repeating it is cheap, but past this the
+                            # model starts greeting people who did not say hi
+    "reasoning": 2,         # ~21k rows of short MCQ; memorised fast
     "instruct": 2,          # dolly is 15k rows of human prose
+    "writing": 2,           # ~13k rows, and long free-form targets overfit
+                            # faster than short ones -- the model starts
+                            # reciting whole no_robots stories verbatim
+    "shell": 2,             # ~45k rows, but the answers are one line each;
+                            # repeating them mostly teaches memorised commands
 }
 MAX_UNANSWERABLE_FRAC = 0.25   # cap on SQuAD-v2 "no answer" examples
+
+# Cap on how much of one task's replies may open with the same command.
+#
+# nl2bash and nl2sh are `find` corpora more than they are shell corpora: 43.1%
+# of the 45,285 shell replies start with `find`, against 0.9% for `ls`, and only
+# 0.46% contain an `ls -a`-style listing at all. A model trained on that answers
+# "what lists all files including hidden ones?" with a find pipeline -- and
+# sometimes ends it in `rm -f`, because that is what the neighbouring rows do.
+# The task weight is then buying `find` flag trivia rather than the everyday
+# commands the weight was allocated for.
+#
+# Down-sampling to this cap keeps every distinct `find` row eligible while
+# giving the rest of the distribution room; the surplus is dropped rather than
+# reweighted, since the alternative is oversampling ~600 `ls` rows to balance
+# ~19.5k `find` ones.
+TASK_HEAD_COMMAND_CAP = {"shell": 0.15}
 
 # Examples whose text is largely non-Latin are dropped rather than run through
 # strip_foreign_scripts(), which would silently hand the model a mangled
@@ -106,6 +160,177 @@ REASONING_PROMPTS = [
     "Answer the question by choosing the correct option below.",
     "Choose the option that best answers the question.",
     "Pick the correct choice for the question below.",
+]
+
+# ---------------------------------------------------------------------------
+# Thinking
+# ---------------------------------------------------------------------------
+# There is no <|THINK|> special token and there cannot be one: Tokenizer.
+# SPECIAL_TOKENS is a fixed list of six, and the merge ids are laid out at
+# `256 + len(SPECIAL_TOKENS)`. Adding a seventh shifts merge_id_offset and
+# invalidates every merge id in artifacts/tokenizer-32768.txt -- i.e. it would
+# invalidate the pretrained checkpoint. So the scratchpad is plain text, in a
+# fixed two-line shape the model can learn and a caller can split on:
+#
+#     Thinking: <a few sentences of working>
+#     Answer: <the final answer>
+#
+# Two rules keep this from becoming a tic:
+#
+# 1. It is only ever attached to rows that carry a REAL rationale upstream --
+#    ecqa's human explanations and the worked solutions in gsm8k / metamath /
+#    orca-math. Nothing is invented. A 169M model taught to emit plausible
+#    reasoning it did not do is strictly worse than one that answers directly,
+#    because the reasoning then reads as evidence and is not.
+#
+# 2. The same sources also produce direct-answer rows (THINK_FRACTION below),
+#    paired with DIRECT_PROMPTS. Without that contrast the marker is not a
+#    behaviour the user can ask for, it is just the house style for anything
+#    that smells like a maths question -- and it leaks into everything else.
+THINK_PREFIX = "Thinking:"
+ANSWER_PREFIX = "Answer:"
+
+# Share of think-capable rows rendered with the scratchpad. The rest are the
+# same question answered flat, so both modes are addressable.
+THINK_FRACTION = 0.75
+
+THINK_PROMPTS = [
+    "Think it through step by step, then give the answer.",
+    "Work through this carefully before answering.",
+    "Reason it out first, then answer.",
+    "Explain your thinking, then state the answer.",
+    "Take it step by step and finish with the answer.",
+]
+DIRECT_PROMPTS = [
+    "Answer directly, without explanation.",
+    "Give just the answer.",
+    "Answer in one line, no working.",
+    "Just the final answer, please.",
+]
+
+
+def _think_reply(rationale, answer):
+    """Render the two-line scratchpad. Falls back to a bare answer when the
+    upstream rationale is missing or degenerate -- see rule 1 above."""
+    rationale = " ".join(str(rationale or "").split())
+    answer = str(answer or "").strip()
+    if not answer:
+        return None
+    if len(rationale) < 16 or rationale.lower() == answer.lower():
+        return answer
+    return f"{THINK_PREFIX} {rationale}\n{ANSWER_PREFIX} {answer}"
+
+
+def split_thinking(text):
+    """Inverse of _think_reply: (thinking, answer). `thinking` is "" when the
+    reply has no scratchpad. Used by chat.py to fold the working away, and by
+    eval code that wants to score only the answer."""
+    if not isinstance(text, str) or THINK_PREFIX not in text:
+        return "", (text or "").strip()
+    _, _, rest = text.partition(THINK_PREFIX)
+    thinking, sep, answer = rest.partition(ANSWER_PREFIX)
+    if not sep:
+        return thinking.strip(), ""
+    return thinking.strip(), answer.strip()
+
+
+# ---------------------------------------------------------------------------
+# Rewriting / rephrasing
+# ---------------------------------------------------------------------------
+# CoEdIT ships its instruction glued to the front of `src` ("Fix grammar in
+# this sentence: ..."), one fixed phrasing per edit type. Training on that
+# verbatim teaches the string, not the edit, so the prefix is split off and
+# replaced with one of ours, chosen by the row's declared edit type.
+REWRITE_PROMPTS = {
+    "gec": [
+        "Fix the grammar in this text.",
+        "Correct any grammatical errors below.",
+        "Rewrite this with the grammar mistakes fixed.",
+    ],
+    "paraphrase": [
+        "Rephrase the text below.",
+        "Say this another way.",
+        "Rewrite this in different words, keeping the meaning.",
+        "Give me a paraphrase of this.",
+    ],
+    "simplification": [
+        "Rewrite this in simpler language.",
+        "Make this easier to read.",
+        "Simplify the text below.",
+    ],
+    "coherence": [
+        "Rewrite this so it reads more coherently.",
+        "Make this flow better.",
+        "Improve the coherence of the text below.",
+    ],
+    "neutralize": [
+        "Rewrite this in a neutral tone.",
+        "Remove the bias from this text.",
+        "Make this sound more impartial.",
+    ],
+    "clarity": [
+        "Rewrite this more clearly.",
+        "Make this clearer and more direct.",
+        "Improve the clarity of the text below.",
+    ],
+}
+REWRITE_FALLBACK_PROMPTS = [
+    "Rewrite the text below.",
+    "Improve this text.",
+]
+
+# ---------------------------------------------------------------------------
+# Linux shell
+# ---------------------------------------------------------------------------
+# Replies are the bare command and nothing else, because that is all the
+# upstream data contains. Writing an explanation around it would mean
+# generating the explanation here, and a synthetic gloss on a command is
+# exactly the kind of confident-sounding filler this model should not be
+# taught to produce.
+SHELL_PROMPTS = [
+    "Write a Linux command for this.",
+    "What shell command does this?",
+    "Give me the bash command for the following.",
+    "How do I do this from the Linux terminal?",
+    "Write a bash one-liner for this task.",
+]
+
+# Interactive shells are not sandboxes, and a one-line answer with no caveat is
+# how a small model gets someone to paste `rm -rf /` into a terminal. Rows whose
+# command matches any of these are dropped rather than taught.
+#
+# Matched with \b rather than anchored to a command separator, so a `sudo`,
+# `doas` or `xargs` prefix cannot walk a destructive command past the filter.
+# The cost is the occasional false positive on a command that merely mentions
+# one of these strings, which is a trade worth making in this direction.
+SHELL_DROP = re.compile("|".join([
+    # rm -rf against / itself, a root-level glob, or a system directory.
+    # `rm -rf ./build` and `rm -f notes.txt` are ordinary and must survive.
+    r"\brm\s+(?:-[-\w]+\s+)*/(?:\s|$|\*|(?:bin|boot|dev|etc|home|lib|proc"
+    r"|root|sbin|srv|sys|usr|var)\b)",
+    r"\bmkfs(?:\.\w+)?\b",
+    # Only block devices. `dd if=image.iso of=/dev/null` is a throughput test.
+    r"\bdd\s+[^;&|]*of=/dev/(?:sd|nvme|hd|vd|disk|mmcblk|loop)",
+    r":\(\)\s*\{",                       # fork bomb
+    # `halt` only in command position: \bhalt\b also matches the -halt-on-error
+    # flag that every LaTeX invocation in these corpora carries.
+    r"\b(?:shutdown|reboot|poweroff)\b",
+    r"(?:^|[;&|]\s*|\bsudo\s+)halt\b",
+    r"\bchmod\s+(?:-[-\w]+\s+)*777\s+/(?:\s|$)",
+    r">\s*/dev/(?:sd|nvme|hd|vd|mmcblk)",
+    r"\bmv\s+[^;&|]*\s/dev/null\b",
+]), re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Writing / drafting
+# ---------------------------------------------------------------------------
+# no_robots Generation and Brainstorm rows already read as natural instructions
+# ("Write me a short poem about..."), so these are only used for dolly, whose
+# creative_writing / brainstorming instructions are sometimes bare topics.
+WRITING_PROMPTS = [
+    "Write a draft for the following.",
+    "Draft this for me.",
+    "Write something for this.",
 ]
 
 
@@ -175,6 +400,27 @@ def _from_messages(row, rng):
     if not all(_mostly_latin(m["content"]) for m in out):
         return None
     return out
+
+
+# no_robots is one repo feeding three tasks. The category column is the whole
+# reason to bother: 8,692 of its 19,000 rows are `Generation` -- human-written
+# drafting examples -- and lumping them into `chat` meant the amount of
+# drafting data in the run was set by how much small talk we wanted.
+NO_ROBOTS_TASKS = {
+    "Generation": "writing",
+    "Brainstorm": "writing",
+    "Rewrite": "rewrite",
+    "Summarize": "summarization",
+}
+
+
+def _from_no_robots(row, rng):
+    """no_robots: same message shape as smoltalk, but routed by category."""
+    messages = _from_messages(row, rng)
+    if not messages:
+        return None
+    task = NO_ROBOTS_TASKS.get(str(row.get("category") or ""))
+    return (messages, task) if task else messages
 
 
 def _from_soda(row, rng):
@@ -283,35 +529,118 @@ def _from_gretel_sql(row, rng):
 
 
 _GSM8K_CALC = re.compile(r"<<[^>]*>>")   # calculator annotations, e.g. <<48/2=24>>
+# Just the marker and its value -- NOT to end of string. metamath often
+# writes "... #### 140 The answer is: 140", so a greedy strip here removes
+# the very sentence _split_worked_solution() keys on and silently drops the
+# think rate from ~70% to ~25%.
+_GSM8K_FINAL = re.compile(r"####\s*\S+")   # "#### 140" answer marker
+
+# "The answer is: 42", "the answer is 42." -- how metamath and orca-math close
+# a worked solution. Anchored to the end so a mid-solution restatement is not
+# mistaken for the conclusion.
+_FINAL_ANSWER = re.compile(
+    r"(?:^|\n|\.\s+)(?:so\s+|therefore,?\s+)?the\s+answer\s+is:?\s*"
+    r"(.+?)\s*\.?\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _split_worked_solution(text):
+    """(steps, final answer) from a solution that states its answer at the end.
+
+    Returns (None, None) when the closing statement is not found, which is the
+    signal to leave the row in its original free-form shape rather than force
+    it into the scratchpad format around a guessed answer.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None, None
+    match = _FINAL_ANSWER.search(text)
+    if not match:
+        return None, None
+    final = " ".join(match.group(1).split())
+    steps = text[:match.start()].strip()
+    # A "solution" that is only its own conclusion has no working to show.
+    if not final or len(final) > 120 or len(steps) < 16:
+        return None, None
+    return steps, final
+
+
+def _math_example(question, steps, final, fallback_reply, rng):
+    """Render a maths row, with or without the scratchpad.
+
+    `fallback_reply` is used when the solution could not be split -- the row is
+    still worth training on, it just cannot carry an Answer: line.
+    """
+    question = _clean(question)
+    if not question:
+        return None
+
+    if steps and final and rng.random() < THINK_FRACTION:
+        reply = _think_reply(steps, final)
+        prompt_pool = THINK_PROMPTS
+    elif steps and final:
+        reply = final                      # the direct-answer contrast
+        prompt_pool = DIRECT_PROMPTS
+    else:
+        reply = _clean(fallback_reply)
+        prompt_pool = MATH_PROMPTS
+    if not reply:
+        return None
+
+    prompt = f"{rng.choice(prompt_pool)}\n\n{question}"
+    return [{"role": "user", "content": prompt},
+            {"role": "assistant", "content": reply}]
 
 
 def _from_gsm8k(row, rng):
     """gsm8k: `answer` is a worked solution ending in '#### <final number>'."""
-    question = _clean(row.get("question"))
+    question = row.get("question")
     raw = row.get("answer")
-    if not question or not isinstance(raw, str) or "####" not in raw:
+    if not isinstance(raw, str) or "####" not in raw:
         return None
     steps, _, final = raw.partition("####")
     steps = _clean(_GSM8K_CALC.sub("", steps))
     final = _clean(final)
     if not steps or not final:
         return None
-    prompt = f"{rng.choice(MATH_PROMPTS)}\n\n{question}"
-    reply = f"{steps}\nThe answer is {final}."
-    return [{"role": "user", "content": prompt},
-            {"role": "assistant", "content": reply}]
+    return _math_example(question, steps, final, None, rng)
 
 
 _BOXED = re.compile(r"\\boxed\{([^{}]*)\}")
 
 
+# MetaMathQA is two corpora under one name, and its `type` column separates
+# them cleanly:
+#
+#   GSM_*   54,869 rows, grade-school word problems, 0.0% LaTeX
+#   MATH_*  35,131 rows, competition algebra/geometry, 28-65% LaTeX
+#
+# Only the GSM half is kept. Two reasons, and they point the same way. A 169M
+# model is not going to solve competition geometry no matter how many examples
+# it sees, so those rows buy nothing but a confident wrong answer in a format
+# that looks authoritative. And they are where essentially all of metamath's
+# LaTeX lives -- \frac, \sqrt, \cdot -- which pretraining barely covered and
+# which _from_metamath already goes out of its way to unwrap from \boxed{}.
+# Filtering here rather than at download keeps the choice next to its reason.
+METAMATH_KEEP_PREFIX = "GSM"
+
+
 def _from_metamath(row, rng):
     """meta-math/MetaMathQA: `query` + `response`, response ends with
-    'The answer is: X'. Kept as-is -- it is already a worked CoT solution in
-    the same shape gsm8k is normalised into."""
+    'The answer is: X' -- already a worked CoT solution in the same shape
+    gsm8k is normalised into, so _math_example can split it."""
+    if not str(row.get("type") or "").startswith(METAMATH_KEEP_PREFIX):
+        return None
     question = _clean(row.get("query"))
     reply = _clean(row.get("response"))
     if not question or not reply:
+        return None
+    # MetaMathQA is built on GSM8K and carries its markup through: calculator
+    # annotations and a trailing "#### <answer>". Left in, both end up inside
+    # the Thinking: block, teaching the model to emit a format marker it is
+    # never asked for and that nothing downstream parses.
+    reply = _GSM8K_CALC.sub("", reply)
+    reply = _GSM8K_FINAL.sub("", reply).strip()
+    if not reply:
         return None
     # A handful of rows carry the MATH-style \boxed{} wrapper; unwrap it so the
     # model is not taught to emit LaTeX control sequences it never saw in
@@ -319,9 +648,8 @@ def _from_metamath(row, rng):
     reply = _BOXED.sub(r"\1", reply)
     if len(reply) < 16:
         return None
-    prompt = f"{rng.choice(MATH_PROMPTS)}\n\n{question}"
-    return [{"role": "user", "content": prompt},
-            {"role": "assistant", "content": reply}]
+    steps, final = _split_worked_solution(reply)
+    return _math_example(question, steps, final, reply, rng)
 
 
 def _from_orca_math(row, rng):
@@ -332,9 +660,8 @@ def _from_orca_math(row, rng):
     if not question or len(reply) < 16:
         return None
     reply = _BOXED.sub(r"\1", reply)
-    prompt = f"{rng.choice(MATH_PROMPTS)}\n\n{question}"
-    return [{"role": "user", "content": prompt},
-            {"role": "assistant", "content": reply}]
+    steps, final = _split_worked_solution(reply)
+    return _math_example(question, steps, final, reply, rng)
 
 
 def _from_mcq_reasoning(row, rng):
@@ -370,6 +697,14 @@ def _from_mcq_reasoning(row, rng):
 
 DOLLY_DROP_CATEGORIES = ("closed_qa", "open_qa", "general_qa")
 
+# Same idea as NO_ROBOTS_TASKS: dolly's categories already say what each row
+# teaches, so route on them instead of filing all 15k rows under `instruct`.
+DOLLY_TASKS = {
+    "creative_writing": "writing",
+    "brainstorming": "writing",
+    "summarization": "summarization",
+}
+
 
 def _from_dolly(row, rng):
     instruction = _clean(row.get("instruction"))
@@ -383,13 +718,108 @@ def _from_dolly(row, rng):
     if category in DOLLY_DROP_CATEGORIES and not context:
         return None
     prompt = instruction if not context else f"{instruction}\n\n{context}"
+    messages = [{"role": "user", "content": prompt},
+                {"role": "assistant", "content": response}]
+    task = DOLLY_TASKS.get(category)
+    return (messages, task) if task else messages
+
+
+def _from_coedit(row, rng):
+    """grammarly/coedit: `src` is "<instruction>: <text>", `tgt` is the edit."""
+    src = _clean(row.get("src"))
+    tgt = _clean(row.get("tgt"))
+    if not src or not tgt:
+        return None
+
+    # Split the glued-on instruction off the front. Only the first ": " counts,
+    # and only when what precedes it is short enough to be an instruction
+    # rather than a colon inside the text itself.
+    head, sep, body = src.partition(": ")
+    if sep and len(head) <= 80:
+        text = body.strip()
+    else:
+        text = src
+    if not text:
+        return None
+
+    edit = str(row.get("task") or "").strip().lower()
+    prompts = REWRITE_PROMPTS.get(edit, REWRITE_FALLBACK_PROMPTS)
+    prompt = f"{rng.choice(prompts)}\n\n{text}"
+    if not _mostly_latin(text) or not _mostly_latin(tgt):
+        return None
     return [{"role": "user", "content": prompt},
-            {"role": "assistant", "content": response}]
+            {"role": "assistant", "content": tgt}]
+
+
+def _shell_example(instruction, command, rng):
+    """Shared renderer for the two natural-language -> bash sources."""
+    instruction = _clean(instruction)
+    command = _clean(command)
+    if not instruction or not command:
+        return None
+    # Multi-line scripts are out of scope; these sources are one-liners and the
+    # few multi-line rows are usually a parse artifact.
+    command = command.strip()
+    if "\n" in command or len(command) > 400:
+        return None
+    if SHELL_DROP.search(command):
+        return None
+    prompt = f"{rng.choice(SHELL_PROMPTS)}\n\n{instruction}"
+    return [{"role": "user", "content": prompt},
+            {"role": "assistant", "content": command}]
+
+
+def _from_nl2bash(row, rng):
+    return _shell_example(row.get("nl_command"), row.get("bash_code"), rng)
+
+
+def _from_nl2sh(row, rng):
+    return _shell_example(row.get("nl"), row.get("bash"), rng)
+
+
+_ECQA_OPTIONS = ("q_op1", "q_op2", "q_op3", "q_op4", "q_op5")
+
+
+def _from_ecqa(row, rng):
+    """yangdong/ecqa: CommonsenseQA plus a human-written explanation.
+
+    This is the only reasoning source here with a real rationale, which is what
+    makes a Thinking: block honest on this task. `taskA_pos` explains why the
+    correct option is correct; `taskB` also argues against the distractors and
+    runs long, so the shorter one is used.
+    """
+    question = _clean(row.get("q_text"))
+    answer = _clean(row.get("q_ans"))
+    if not question or not answer:
+        return None
+
+    options = [_clean(row.get(k)) for k in _ECQA_OPTIONS]
+    options = [o for o in options if o]
+    if len(options) < 2 or answer not in options:
+        return None
+
+    labels = [chr(ord("A") + i) for i in range(len(options))]
+    rendered = "\n".join(f"{lab}) {opt}" for lab, opt in zip(labels, options))
+    label = labels[options.index(answer)]
+    final = f"{label}) {answer}"
+
+    if rng.random() < THINK_FRACTION:
+        reply = _think_reply(row.get("taskA_pos"), final)
+        prompt_pool = THINK_PROMPTS
+    else:
+        reply = final
+        prompt_pool = DIRECT_PROMPTS
+    if not reply:
+        return None
+
+    prompt = f"{rng.choice(prompt_pool)}\n\n{question}\n\n{rendered}"
+    return [{"role": "user", "content": prompt},
+            {"role": "assistant", "content": reply}]
 
 
 NORMALIZERS = {
     "smoltalk": _from_messages,
-    "no-robots": _from_messages,
+    "no-robots": _from_no_robots,
     "soda": _from_soda,
     "squad-v2": _from_squad,
     "sciq": _from_sciq,
@@ -405,6 +835,10 @@ NORMALIZERS = {
     "arc-challenge": _from_mcq_reasoning,
     "arc-easy": _from_mcq_reasoning,
     "commonsense-qa": _from_mcq_reasoning,
+    "ecqa": _from_ecqa,
+    "coedit": _from_coedit,
+    "nl2bash": _from_nl2bash,
+    "nl2sh": _from_nl2sh,
 }
 
 
@@ -542,8 +976,20 @@ def _normalize_frame(key, task, df, rng):
     rows = []
     unanswerable = 0
     kept = 0
+    routed = {}
     for record in records:
-        messages = fn(record, rng)
+        result = fn(record, rng)
+        if not result:
+            continue
+        # A normalizer may return (messages, task) to override the repo-level
+        # task for that row -- no_robots and dolly both carry a category column
+        # that says what the row actually teaches. Anything else is the plain
+        # message list and keeps the manifest's task.
+        if isinstance(result, tuple):
+            messages, row_task = result
+            row_task = row_task or task
+        else:
+            messages, row_task = result, task
         if not messages:
             continue
         if key == "squad-v2":
@@ -553,22 +999,284 @@ def _normalize_frame(key, task, df, rng):
                     continue
                 unanswerable += 1
         kept += 1
+        routed[row_task] = routed.get(row_task, 0) + 1
         rows.append({
             "source": key,
-            "task": task,
+            "task": row_task,
             "messages": json.dumps(messages),
         })
+    if len(routed) > 1:
+        breakdown = ", ".join(f"{t}={n:,}" for t, n in sorted(routed.items()))
+        print(f"  routed by category: {breakdown}")
     return rows
 
 
-def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
+# ---------------------------------------------------------------------------
+# Small talk
+# ---------------------------------------------------------------------------
+# A bare "hi" is the first thing anyone types at a chat model and the mixture
+# had no answer for it. The greeting rows that exist are real but invisible:
+# 1,872 smoltalk conversations open with one, every one of them answered with
+# the same sentence, and each is the first exchange of a 6-8 turn conversation
+# rendered as a single training example -- so the eight tokens of "Hello! How
+# can I help you today?" are ~1% of that example's supervised loss, and the
+# whole behaviour is ~0.04% of an epoch's gradient. A model trained on that
+# answers "hi" with an essay about whatever the rest of the conversation was
+# about, which is exactly what it did.
+#
+# So: harvest the real openers (see harvest_smalltalk) and pair them with the
+# turns the corpus has none of -- thanks, goodbye, how-are-you, and the
+# identity and capability questions that otherwise get answered from whatever
+# first-person narration the corpus happens to contain ("I am Elena, a young
+# woman from a small town in the Czech Republic").
+#
+# Three rules, the same ones the rest of this file follows:
+#
+# 1. Replies are SHORT and every one ends the turn. This is the one task where
+#    the correct answer is a sentence, which makes it the cheapest possible
+#    training signal for stopping.
+# 2. Many phrasings on both sides, paired at random. One fixed reply teaches
+#    the string; a pool teaches the behaviour.
+# 3. The identity and capability answers claim nothing the model cannot back
+#    up -- no name, no feelings, no memory between chats, no web access, and a
+#    capability list that is literally the task list it was trained on. These
+#    are the lines to edit if this model is deployed as something with a name.
+SMALLTALK_OPENERS = [
+    "hi", "Hi", "hi!", "hello", "Hello", "hello!", "Hello!", "hey", "Hey",
+    "hey!", "hey there", "Hi there", "hiya", "howdy", "yo", "greetings",
+    "good morning", "Good morning", "good afternoon", "good evening",
+    "morning", "hi, how are you?", "hello, are you there?", "anyone there?",
+    "hey, got a minute?", "hi again", "hello?", "Hi!",
+]
+SMALLTALK_OPENER_REPLIES = [
+    "Hello! How can I help you today?",
+    "Hi! What can I do for you?",
+    "Hello! What would you like help with?",
+    "Hi there! What are you working on?",
+    "Hey! What can I help you with?",
+    "Hello! Ask me anything you like.",
+    "Hi! How can I help?",
+    "Hello! What's on your mind?",
+    "Hi there! What do you need?",
+    "Hello! Happy to help -- what do you need?",
+]
+SMALLTALK_HOW_ARE_YOU = [
+    "how are you?", "How are you?", "how are you doing?", "how's it going?",
+    "how have you been?", "you doing ok?", "how are things?", "what's up?",
+    "what's new?", "how's your day going?",
+]
+SMALLTALK_HOW_ARE_YOU_REPLIES = [
+    "I'm a program, so I don't have good days or bad ones -- but I'm ready to help. What do you need?",
+    "I don't have feelings to report, but everything's working. What can I do for you?",
+    "Doing fine, as much as software can. What are you working on?",
+    "I'm here and ready to go. What would you like to do?",
+    "No news on my end -- I don't carry anything over between chats. What can I help with?",
+    "All systems working. What can I help you with?",
+]
+SMALLTALK_THANKS = [
+    "thanks", "thanks!", "Thanks", "thank you", "thank you!", "thanks a lot",
+    "thanks so much", "cheers", "ty", "appreciate it", "that helps, thanks",
+    "perfect, thanks", "great, thank you",
+]
+SMALLTALK_THANKS_REPLIES = [
+    "You're welcome! Anything else?",
+    "Happy to help. Let me know if you need anything else.",
+    "Any time. Anything else you'd like to look at?",
+    "You're welcome.",
+    "Glad it helped!",
+    "No problem -- just ask if something else comes up.",
+]
+SMALLTALK_BYE = [
+    "bye", "goodbye", "bye!", "see ya", "see you later", "that's all",
+    "that's all for now", "nothing else", "I'm done", "no thanks, that's it",
+    "gotta go", "later!",
+]
+SMALLTALK_BYE_REPLIES = [
+    "Goodbye! Come back any time.",
+    "See you later!",
+    "Bye -- good luck with it.",
+    "Take care!",
+    "Sounds good. See you next time.",
+    "Bye for now.",
+]
+SMALLTALK_IDENTITY = [
+    "who are you?", "what are you?", "what's your name?", "do you have a name?",
+    "are you a human?", "are you a robot?", "are you an AI?", "are you real?",
+    "am I talking to a person?", "tell me about yourself",
+    "what kind of model are you?", "are you ChatGPT?",
+]
+SMALLTALK_IDENTITY_REPLIES = [
+    "I'm a small language model -- a program that answers questions in text. I don't have a name.",
+    "I'm an AI assistant, not a person. I answer in text and that's all I can do.",
+    "Not a human -- I'm a language model. I generate text, one word at a time.",
+    "I'm a small AI text assistant. No name, no body, and no memory of past conversations.",
+    "I'm a computer program trained to answer questions and write text. I'm not a person.",
+    "I'm a language model. I'm quite a small one, so I get things wrong sometimes -- worth checking anything important.",
+]
+SMALLTALK_CAPABILITY = [
+    "what can you do?", "what are you good at?", "how can you help me?",
+    "what can I ask you?", "can you help me?", "what do you do?",
+    "what should I ask you?", "are you any good?",
+]
+SMALLTALK_CAPABILITY_REPLIES = [
+    "I can answer questions, summarize text, rewrite or fix writing, draft short "
+    "pieces, work through maths problems, and write shell commands or SQL queries. "
+    "What do you need?",
+    "Ask me to summarize something, answer a question about a passage, tidy up some "
+    "writing, draft an email, solve a maths problem, or write a shell command.",
+    "Summarizing, answering questions, rewriting text, drafting, simple maths, and "
+    "shell or SQL one-liners. What are you working on?",
+    "Mostly text: questions and answers, summaries, rewriting, drafting, maths, and "
+    "commands. I'm small, so I'm better at short, concrete tasks than long ones.",
+    "I can help with writing and rewriting, summaries, questions about a passage, "
+    "maths problems, and shell or SQL commands. What would you like to start with?",
+]
+
+# (prompts, replies) pools making up the task.
+SMALLTALK_GROUPS = [
+    (SMALLTALK_OPENERS, SMALLTALK_OPENER_REPLIES),
+    (SMALLTALK_HOW_ARE_YOU, SMALLTALK_HOW_ARE_YOU_REPLIES),
+    (SMALLTALK_THANKS, SMALLTALK_THANKS_REPLIES),
+    (SMALLTALK_BYE, SMALLTALK_BYE_REPLIES),
+    (SMALLTALK_IDENTITY, SMALLTALK_IDENTITY_REPLIES),
+    (SMALLTALK_CAPABILITY, SMALLTALK_CAPABILITY_REPLIES),
+]
+
+# Openers the corpus already answers correctly, lifted out of the multi-turn
+# conversations that bury them. Matched against the FIRST user turn only.
+SMALLTALK_HARVEST = re.compile(
+    r"^(hi|hello|hey|yo|howdy|greetings|good (morning|afternoon|evening|day)|"
+    r"how are you( doing)?|how'?s it going)\b[\s!.,?]*$", re.IGNORECASE)
+SMALLTALK_HARVEST_MAX_WORDS = 45     # a greeting answer is a sentence, not an essay
+
+
+def harvest_smalltalk(rows):
+    """Pull (greeting, short reply) first exchanges out of multi-turn rows.
+
+    Real data, not authored: the corpus answers these correctly, it just does
+    it inside conversations long enough that the behaviour never gets any
+    gradient. Returned as standalone two-message conversations.
+    """
+    out = []
+    for row in rows:
+        try:
+            messages = json.loads(row["messages"])
+        except (TypeError, ValueError):
+            continue
+        if len(messages) < 2 or messages[0]["role"] != "user":
+            continue
+        opener = messages[0]["content"].strip()
+        reply = messages[1]["content"].strip()
+        if not SMALLTALK_HARVEST.match(opener):
+            continue
+        if not reply or len(reply.split()) > SMALLTALK_HARVEST_MAX_WORDS:
+            continue
+        out.append({"source": "smoltalk-greetings", "task": "smalltalk",
+                    "messages": json.dumps(
+                        [{"role": "user", "content": opener},
+                         {"role": "assistant", "content": reply}])})
+    return out
+
+
+def build_smalltalk_rows(rng, harvested=()):
+    """Every prompt x reply pairing in SMALLTALK_GROUPS, plus the harvested ones.
+
+    Enumerated rather than sampled: the pools are small and the whole point is
+    that every phrasing is covered, so the model keys on the behaviour instead
+    of on the three strings smoltalk happens to contain.
+    """
+    rows = list(harvested)
+    for prompts, replies in SMALLTALK_GROUPS:
+        for prompt in prompts:
+            for reply in replies:
+                rows.append({
+                    "source": "smalltalk", "task": "smalltalk",
+                    "messages": json.dumps(
+                        [{"role": "user", "content": prompt},
+                         {"role": "assistant", "content": reply}]),
+                })
+    rng.shuffle(rows)
+    return rows
+
+
+def _head_command(messages_json):
+    """First word of the assistant reply -- the command a shell answer runs."""
+    try:
+        messages = json.loads(messages_json)
+    except (TypeError, ValueError):
+        return ""
+    if not messages:
+        return ""
+    reply = str(messages[-1].get("content", "")).strip()
+    if not reply:
+        return ""
+    head = re.split(r"[\s|;&]+", reply)[0]
+    # A leading `sudo`/`env` says nothing about what the row teaches; the word
+    # after it does.
+    if head in ("sudo", "env", "time", "nohup") and len(reply.split()) > 1:
+        head = re.split(r"[\s|;&]+", reply)[1]
+    return head
+
+
+def _cap_head_command(rows, rng, caps=None):
+    """Drop rows so no single opening command exceeds its task's share.
+
+    See TASK_HEAD_COMMAND_CAP. Only tasks listed there are touched; everything
+    else is returned untouched and in its original order.
+    """
+    caps = TASK_HEAD_COMMAND_CAP if caps is None else caps
+    if not caps:
+        return rows
+    totals = Counter(r["task"] for r in rows if r["task"] in caps)
+    if not totals:
+        return rows
+
+    order = list(range(len(rows)))
+    rng.shuffle(order)          # which copies survive is random, not positional
+    budgets, kept_flag = {}, [True] * len(rows)
+    dropped = Counter()
+    for i in order:
+        row = rows[i]
+        task = row["task"]
+        if task not in caps:
+            continue
+        head = _head_command(row["messages"])
+        if not head:
+            continue
+        key = (task, head)
+        budget = budgets.get(key)
+        if budget is None:
+            budget = max(1, int(caps[task] * totals[task]))
+            budgets[key] = budget
+        if budget <= 0:
+            kept_flag[i] = False
+            dropped[key] += 1
+            continue
+        budgets[key] = budget - 1
+
+    if dropped:
+        for (task, head), n in dropped.most_common(5):
+            print(f"  {task}: dropped {n:,} rows opening with `{head}` "
+                  f"(cap {caps[task]:.0%} of {totals[task]:,})")
+    return [r for r, keep in zip(rows, kept_flag) if keep]
+
+
+def cache_paths(cache_dir=None):
+    """(train, val) parquet paths for a cache directory."""
+    folder = cache_dir or CACHE_FOLDER
+    return (os.path.join(folder, "sft_train.parquet"),
+            os.path.join(folder, "sft_val.parquet"))
+
+
+def build_sft_cache(force=False, val_per_task=VAL_PER_TASK, cache_dir=None):
     """Normalize every downloaded source into two parquet files.
 
     Mirrors the pretrain side's "parquet on disk, read lazily" approach rather
     than re-parsing eleven different schemas on every training run.
     """
-    if os.path.exists(TRAIN_CACHE) and os.path.exists(VAL_CACHE) and not force:
-        return TRAIN_CACHE, VAL_CACHE
+    train_cache, val_cache = cache_paths(cache_dir)
+    if os.path.exists(train_cache) and os.path.exists(val_cache) and not force:
+        return train_cache, val_cache
 
     if not os.path.exists(MANIFEST_FILE):
         raise FileNotFoundError(
@@ -577,7 +1285,7 @@ def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
     with open(MANIFEST_FILE) as f:
         manifest = json.load(f)
 
-    os.makedirs(CACHE_FOLDER, exist_ok=True)
+    os.makedirs(os.path.dirname(train_cache) or ".", exist_ok=True)
     rng = random.Random(SEED)
 
     train_rows, val_rows = [], []
@@ -597,6 +1305,21 @@ def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
             print(f"  val:   {len(val_df)} rows -> {len(rows)} conversations")
             val_rows.extend(rows)
 
+    # Small talk: harvest the real greeting openers buried in multi-turn rows,
+    # then add the turns the corpus has none of. Built here rather than from a
+    # manifest entry because there is no repo to download -- see the Small talk
+    # section above.
+    harvested = harvest_smalltalk(train_rows)
+    smalltalk = build_smalltalk_rows(rng, harvested)
+    print(f"Small talk: {len(harvested):,} harvested + "
+          f"{len(smalltalk) - len(harvested):,} authored = {len(smalltalk):,} rows")
+    train_rows.extend(smalltalk)
+
+    # Flatten command monocultures before the split, so the holdout reflects
+    # the same distribution the model is actually trained on.
+    train_rows = _cap_head_command(train_rows, rng)
+    val_rows = _cap_head_command(val_rows, rng)
+
     # Any source without its own validation files donates from train.
     #
     # Keyed on (task, source), not task. Keyed on task alone, a single source
@@ -611,8 +1334,19 @@ def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
         for r in train_rows:
             by_source.setdefault((r["task"], r["source"]), []).append(r)
         train_rows = []
-        per_source_target = max(1, val_per_task // max(1, len(by_source)))
+        # val_per_task is per TASK, so what each source owes depends on how many
+        # sources ITS task has -- not on how many sources exist in total.
+        # Dividing by len(by_source) made the budget global instead: across 11
+        # sources every donor gave 200 // 11 = 18 rows, which left `chat` with a
+        # 28-example holdout while `extractive_qa`, which ships its own
+        # validation split and donates nothing, kept all 200. Every small task
+        # is a donor, so the tasks with the least data also got the least
+        # validation -- writing, rewrite and shell would each have been steered
+        # on ~14 examples, which is noise, not a curve.
+        sources_per_task = Counter(task for task, _ in by_source)
         for pair, rows in by_source.items():
+            per_source_target = max(
+                1, val_per_task // max(1, sources_per_task[pair[0]]))
             if pair in have_val:
                 need = 0
             else:
@@ -626,8 +1360,6 @@ def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
     # Capped per source as well, so one large published validation split
     # cannot crowd its task-mates out of the holdout.
     val_sources = {(r["task"], r["source"]) for r in val_rows}
-    per_task_source = max(1, val_per_task // max(
-        1, len({t for t, _ in val_sources})))
     trimmed = []
     counts, source_counts = {}, {}
     rng.shuffle(val_rows)
@@ -646,8 +1378,8 @@ def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
     val_rows = trimmed
 
     rng.shuffle(train_rows)
-    pd.DataFrame(train_rows).to_parquet(TRAIN_CACHE)
-    pd.DataFrame(val_rows).to_parquet(VAL_CACHE)
+    pd.DataFrame(train_rows).to_parquet(train_cache)
+    pd.DataFrame(val_rows).to_parquet(val_cache)
 
     print(f"\nWrote {len(train_rows):,} train / {len(val_rows):,} val conversations")
     for task in sorted({r["task"] for r in train_rows}):
@@ -657,7 +1389,7 @@ def build_sft_cache(force=False, val_per_task=VAL_PER_TASK):
         print(f"  {task:15s} {n:>8,} train | {v:>4,} val "
               f"from {', '.join(sources) or '-'}")
 
-    return TRAIN_CACHE, VAL_CACHE
+    return train_cache, val_cache
 
 
 # ---------------------------------------------------------------------------
@@ -672,13 +1404,14 @@ class SFTDataset(Dataset):
     """
 
     def __init__(self, batch_size=8, split="train", task_weights=None,
-                 total_examples=None, seed=SEED, epochs=1):
+                 total_examples=None, seed=SEED, epochs=1, cache_dir=None):
         self.batch_size = batch_size
         self.split = split
 
-        path = TRAIN_CACHE if split == "train" else VAL_CACHE
+        train_cache, val_cache = cache_paths(cache_dir)
+        path = train_cache if split == "train" else val_cache
         if not os.path.exists(path):
-            build_sft_cache()
+            build_sft_cache(cache_dir=cache_dir)
         self.df = pd.read_parquet(path)
         if len(self.df) == 0:
             raise RuntimeError(f"{path} is empty")
@@ -793,6 +1526,23 @@ class SFTDataset(Dataset):
                     alloc[t] = 0
                 break
         return alloc
+
+    def subset(self, task):
+        """A shallow view of this dataset restricted to one task.
+
+        Shares the underlying dataframe -- only the index is rebuilt -- so the
+        trainer can hold one of these per task for per-task validation without
+        re-reading the cache ten times. Returns None when the task has no rows.
+        """
+        ids = self._by_task.get(task)
+        if ids is None or len(ids) == 0:
+            return None
+        view = copy.copy(self)
+        view.index = ids
+        view.tasks = [task]
+        view._by_task = {task: ids}
+        view._num_batches = math.ceil(len(ids) / self.batch_size)
+        return view
 
     def describe(self):
         lines = [f"{self.split}: {len(self.index):,} examples in "

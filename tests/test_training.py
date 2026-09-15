@@ -4,7 +4,8 @@ import pytest
 import torch
 
 from nanollm.model import IGNORE_INDEX, Transformer
-from nanollm.train.common import build_optimizer, clip_and_step, pad_batch
+from nanollm.train.common import (LossWeighting, build_optimizer, clip_and_step,
+                                  pad_batch)
 from nanollm.train.dpo import build_pair_batch, dpo_loss, sequence_logprobs
 from nanollm.utils.schedules import make_lr_fn
 
@@ -157,3 +158,99 @@ def test_sequence_logprobs_length_normalization():
     # length-normalised is the default
     with torch.no_grad():
         assert torch.allclose(sequence_logprobs(model, xs, ys), mean)
+
+
+# -- SFT loss weighting -----------------------------------------------------
+
+def test_eos_weight_lifts_long_replies_and_leaves_short_ones_alone():
+    w = LossWeighting(eos_id=9, eos_share=0.02, eos_cap=12.0)
+    # A short reply already stops reliably; its EOS share is above the floor,
+    # so the weight must stay at 1 rather than being pulled *down*.
+    short = w.row_weights([1, 2, 3, 9], [0, 1, 1, 1])
+    assert short == [0.0, 1.0, 1.0, 1.0]
+    # A long reply: 2% of the mass on EOS means w/((L-1)+w) == 0.02.
+    ids = list(range(200)) + [9]
+    mask = [0] + [1] * 200
+    long = w.row_weights(ids, mask)
+    supervised = sum(mask)
+    assert long[-1] == pytest.approx(0.02 * (supervised - 1) / 0.98)
+    assert long[-1] / (supervised - 1 + long[-1]) == pytest.approx(0.02)
+
+
+def test_eos_weight_respects_the_cap():
+    w = LossWeighting(eos_id=9, eos_share=0.5, eos_cap=4.0)
+    ids = list(range(500)) + [9]
+    assert w.row_weights(ids, [0] + [1] * 500)[-1] == 4.0
+
+
+def test_eos_weight_ignores_rows_that_do_not_end_in_eos():
+    w = LossWeighting(eos_id=9, eos_share=0.02)
+    ids = list(range(200)) + [5]            # truncated: no closing EOS
+    assert w.row_weights(ids, [0] + [1] * 200)[-1] == 1.0
+
+
+def test_per_example_normalisation_gives_every_example_equal_mass():
+    w = LossWeighting(per_example=True)
+    short = w.row_weights([1, 2, 9], [0, 1, 1])
+    long = w.row_weights(list(range(100)) + [9], [0] + [1] * 100)
+    assert sum(short) == pytest.approx(1.0)
+    assert sum(long) == pytest.approx(1.0)
+
+
+def test_pad_batch_weights_align_with_targets():
+    w = LossWeighting(eos_id=9, eos_share=0.0)     # inactive -> 2-tuple
+    assert len(pad_batch([([1, 2, 3, 9], [0, 1, 1, 1])], pad_id=0,
+                         weighting=w)) == 2
+    w = LossWeighting(per_example=True)
+    xs, ys, ws = pad_batch([([1, 2, 3, 9], [0, 1, 1, 1])], pad_id=0, weighting=w)
+    assert ws.shape == ys.shape
+    # Weight is non-zero exactly where the target is supervised.
+    assert torch.equal(ws[0] > 0, ys[0] != IGNORE_INDEX)
+
+
+def test_pad_batch_zero_weights_padding():
+    w = LossWeighting(per_example=True)
+    _, ys, ws = pad_batch([([1, 2, 3, 9], [0, 1, 1, 1]), ([4, 9], [0, 1])],
+                          pad_id=0, weighting=w)
+    assert ws[1, 1:].sum() == 0.0            # padded tail carries no loss
+    assert torch.equal(ws > 0, ys != IGNORE_INDEX)
+
+
+def test_uniform_weights_reproduce_the_token_mean(tiny_model):
+    idx = torch.randint(0, tiny_model.vocab_size, (2, 12))
+    xs, ys = idx[:, :-1], idx[:, 1:].clone()
+    ys[:, :3] = IGNORE_INDEX
+    plain = tiny_model.calculate_loss(xs, ys)
+    ones = tiny_model.calculate_loss(xs, ys, weights=torch.ones_like(ys,
+                                                                    dtype=torch.float))
+    scaled = tiny_model.calculate_loss(xs, ys, weights=torch.full_like(
+        ys, 7.0, dtype=torch.float))
+    assert torch.allclose(plain, ones, atol=1e-6)
+    # A uniform rescale cancels in a weighted mean.
+    assert torch.allclose(plain, scaled, atol=1e-5)
+
+
+def test_weighting_matches_a_hand_computed_weighted_mean(tiny_model):
+    """The weighted loss is exactly sum(w*ce)/sum(w) over supervised tokens.
+
+    Checked against the per-token losses directly rather than against a
+    "is it closer to X" inequality: on an untrained model every token has
+    essentially the same loss, so any such comparison is measuring noise.
+    """
+    torch.manual_seed(0)
+    tiny_model.z_loss_weight = 0.0            # isolate the CE term
+    idx = torch.randint(0, tiny_model.vocab_size, (2, 12))
+    xs, ys = idx[:, :-1], idx[:, 1:].clone()
+    ys[:, :2] = IGNORE_INDEX
+    w = torch.rand_like(ys, dtype=torch.float) + 0.5
+    w[0, -1] = 12.0                           # an EOS-style upweight
+
+    got = tiny_model.calculate_loss(xs, ys, weights=w)
+
+    logits = tiny_model(xs)[0].float()
+    per = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, tiny_model.vocab_size), ys.reshape(-1),
+        reduction="none", ignore_index=IGNORE_INDEX).reshape(ys.shape)
+    valid = (ys != IGNORE_INDEX).float()
+    want = (per * w * valid).sum() / (w * valid).sum()
+    assert torch.allclose(got, want, atol=1e-5)

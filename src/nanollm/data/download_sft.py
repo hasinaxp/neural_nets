@@ -3,6 +3,7 @@ import json
 import os
 import re
 
+import pandas as pd
 from huggingface_hub import list_repo_files, hf_hub_download
 from tqdm import tqdm
 
@@ -21,8 +22,14 @@ KEEP_SPLITS = ("train", "validation", "valid", "dev")
 #
 #   id        HF repo id
 #   task      what this data teaches; the loader uses it to weight the mixture
+#             (a normalizer may override it per row -- see ROUTERS in sft.py)
 #   max_rows  subsample cap (None = take everything). Applied per split.
 #   config    HF config/subset name, when the repo has more than one
+#   files     explicit {split: remote path} for repos that ship no parquet.
+#             Needed because `datasets` is not installed here, so the old
+#             load_dataset() fallback silently failed and left five configured
+#             sources with zero rows on disk. json/jsonl/csv are read directly
+#             with pandas and written out as parquet.
 #   enabled   set False to skip by default
 REPOS = {
     # ---- chat / small talk -------------------------------------------------
@@ -31,6 +38,11 @@ REPOS = {
         "task": "chat",
         "max_rows": None,
     },
+    # Routed per row by category in sft.py: Generation/Brainstorm become
+    # `writing`, Rewrite becomes `rewrite`, the rest stay `chat`. 8.7k of these
+    # 19k rows are human-written Generation examples -- the single best drafting
+    # data in the whole mixture, and until now all of it was buried in `chat`
+    # where its weight was set by how much small talk we wanted.
     "no-robots": {
         "id": "HuggingFaceH4/no_robots",
         "task": "chat",
@@ -59,15 +71,14 @@ REPOS = {
         "max_rows": None,
     },
     # ---- summarization -----------------------------------------------------
-    "samsum": {
-        "id": "Samsung/samsum",
-        "task": "summarization",
-        "max_rows": None,
-    },
+    # Samsung/samsum was here and is gone: the repo now 401s for anonymous
+    # clients, which is why dataset/sft/samsum/ is empty. dialogsum covers the
+    # same dialogue-summary shape and xsum covers the article shape.
     "dialogsum": {
         "id": "knkarthick/dialogsum",
         "task": "summarization",
         "max_rows": None,
+        "files": {"train": "train.csv", "validation": "validation.csv"},
     },
     "xsum": {
         "id": "EdinburghNLP/xsum",
@@ -77,11 +88,40 @@ REPOS = {
         # for mostly fit. It is also the only non-dialogue summarization source
         # here -- without it the task is entirely chat transcripts.
     },
+    # ---- rewriting / rephrasing -------------------------------------------
+    # CoEdIT is the whole reason `rewrite` can be its own task: 69k rows of
+    # paired src/tgt across six edit types (gec, paraphrase, simplification,
+    # coherence, neutralize, clarity). The upstream `src` field already carries
+    # an instruction prefix; the normalizer splits it off and re-wraps with our
+    # own paraphrases, so the model keys off the behaviour, not one sentence.
+    "coedit": {
+        "id": "grammarly/coedit",
+        "task": "rewrite",
+        "max_rows": None,
+        "files": {"train": "train.jsonl", "validation": "validation.jsonl"},
+    },
+    # ---- linux shell -------------------------------------------------------
+    # Two sources so the task is not one author's phrasing habits. nl2bash is
+    # the classic hand-built set, NL2SH-ALFA is larger and noisier; capped so
+    # it cannot swamp the cleaner one.
+    "nl2bash": {
+        "id": "AnishJoshi/nl2bash-custom",
+        "task": "shell",
+        "max_rows": None,
+        "files": {"train": "data/train.json", "validation": "data/dev.json"},
+    },
+    "nl2sh": {
+        "id": "westenfelder/NL2SH-ALFA",
+        "task": "shell",
+        "max_rows": 25_000,
+        "files": {"train": "train.csv"},
+    },
     # ---- text to SQL -------------------------------------------------------
     "sql-create-context": {
         "id": "b-mc2/sql-create-context",
         "task": "sql",
         "max_rows": None,            # 78.6k, schema is in the prompt
+        "files": {"train": "sql_create_context_v4.json"},
     },
     "synthetic-text-to-sql": {
         "id": "gretelai/synthetic_text_to_sql",
@@ -89,10 +129,12 @@ REPOS = {
         "max_rows": None,            # ~106k; filter complexity at load time
     },
     # ---- instruction variety ----------------------------------------------
+    # Also routed per row: creative_writing and brainstorming become `writing`.
     "dolly": {
         "id": "databricks/databricks-dolly-15k",
         "task": "instruct",
         "max_rows": None,
+        "files": {"train": "databricks-dolly-15k.jsonl"},
     },
     # ---- math (chain-of-thought word problems) -----------------------------
     # gsm8k alone is ~7.5k rows, and at a 0.10 task weight that was small
@@ -109,17 +151,33 @@ REPOS = {
     "metamath": {
         "id": "meta-math/MetaMathQA",
         "task": "math",
-        "max_rows": 60_000,          # ~395k upstream, GSM8K/MATH augmentations
+        # Raised from 60k. metamath closes every solution with "The answer
+        # is: X", so ~70% of its rows can be split into a Thinking: block and a
+        # final answer. It is the only large maths source where that is true,
+        # so it should be the one carrying the task.
+        "max_rows": 90_000,          # ~395k upstream, GSM8K/MATH augmentations
+        "files": {"train": "MetaMathQA-395K.json"},
     },
     "orca-math": {
         "id": "microsoft/orca-math-word-problems-200k",
         "task": "math",
-        "max_rows": 60_000,          # ~200k upstream, worked solutions
+        # Cut from 60k. orca-math's solutions end in a free-form sentence with
+        # no answer marker, so they stay in their original shape -- fine on its
+        # own, but at 60k rows it outnumbered the think-formatted sources 8:1
+        # and diluted the format it cannot participate in. Kept for the variety
+        # of its problem phrasings.
+        "max_rows": 25_000,          # ~200k upstream, worked solutions
     },
     # ---- reasoning (grounded multiple-choice) -------------------------------
-    # Replies here are deliberately terse ("B) ...") with no rationale, which
-    # is consistent with what the prompt asks for. The CoT habit is taught by
-    # the math task, whose prompts explicitly ask for reasoning.
+    # arc/commonsense_qa ship no rationale, so their replies are the bare
+    # choice. ecqa is CommonsenseQA *with* a human-written explanation, which
+    # is what makes a Thinking: block on this task real rather than invented --
+    # see THINK_PROMPTS in sft.py.
+    "ecqa": {
+        "id": "yangdong/ecqa",
+        "task": "reasoning",
+        "max_rows": None,            # ~7.6k train rows, human rationales
+    },
     "arc-challenge": {
         "id": "allenai/ai2_arc",
         "task": "reasoning",
@@ -138,7 +196,6 @@ REPOS = {
         "max_rows": None,            # ~9.7k train rows; test split has no labels
     },
 }
-
 
 def prepare_folders():
     for key in REPOS:
@@ -213,13 +270,84 @@ def download_parquet_files(key, force=False):
     return written
 
 
+_PLAIN_READERS = {
+    ".jsonl": lambda p: pd.read_json(p, lines=True),
+    ".json": lambda p: pd.read_json(p),
+    ".csv": lambda p: pd.read_csv(p),
+    ".tsv": lambda p: pd.read_csv(p, sep="\t"),
+}
+
+
+def download_plain_files(key, force=False):
+    """Repos that ship json/jsonl/csv instead of parquet.
+
+    This path exists because `datasets` is not installed in this environment,
+    so download_via_datasets() raised ModuleNotFoundError for every non-parquet
+    source and main() swallowed it as "FAILED <key>". Five configured sources
+    (dolly, dialogsum, metamath, sql-create-context, and the now-gated samsum)
+    were silently absent from the mixture as a result -- the loader only warns
+    about tasks with *no* data at all, and each of those tasks had at least one
+    parquet source keeping it alive.
+
+    Reads each file named in REPOS[key]["files"] with pandas and writes it out
+    as parquet, so everything downstream sees the same format the fast path
+    produces. Returns None if the repo declares no explicit file list.
+    """
+    repo = REPOS[key]
+    files = repo.get("files")
+    if not files:
+        return None
+
+    written = []
+    for split, remote in files.items():
+        dest_path = f"{DATASET_FOLDER}/{key}/{split}.parquet"
+        if os.path.exists(dest_path) and not force:
+            print(f"  {split}: exists, skipping")
+            written.append(dest_path)
+            continue
+
+        suffix = os.path.splitext(remote)[1].lower()
+        reader = _PLAIN_READERS.get(suffix)
+        if reader is None:
+            print(f"  {split}: no reader for {suffix}, skipping {remote}")
+            continue
+
+        local = hf_hub_download(repo_id=repo["id"], filename=remote,
+                                repo_type=REPO_TYPE)
+        df = reader(local)
+
+        # Cap here rather than in subsample_in_place(): that helper keys off
+        # "train" appearing in the filename, and these are already named by
+        # split, so a capped validation file would slip through uncapped.
+        cap = repo.get("max_rows")
+        if cap and split == "train" and len(df) > cap:
+            print(f"  {split}: capping {len(df)} -> {cap} rows")
+            df = df.sample(n=cap, random_state=1337).reset_index(drop=True)
+
+        # Object columns holding dicts/lists survive the parquet round-trip
+        # fine; columns that are entirely null do not, so drop them.
+        df = df.dropna(axis=1, how="all")
+        df.to_parquet(dest_path)
+        print(f"  {split}: {len(df):,} rows -> {dest_path}")
+        written.append(dest_path)
+
+    return written or None
+
+
 def download_via_datasets(key, force=False):
     """Fallback: load through `datasets` and write parquet ourselves.
 
     Needed for repos that ship csv/json instead of parquet, and for anything
     with a max_rows cap, since subsampling means we have to rewrite the file.
     """
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError(
+            f"{key} ships no parquet and has no 'files' entry in REPOS, so it "
+            f"needs the `datasets` package, which is not installed. Either add "
+            f"an explicit files={{split: path}} mapping for it (preferred -- see "
+            f"download_plain_files) or `pip install datasets`.") from e
 
     repo = REPOS[key]
     print(f"Loading {repo['id']} through the datasets library...")
@@ -303,15 +431,20 @@ def download_dataset(key, force=False):
     # repo before subsampling -- soda downloaded 1.5M rows to keep 60k. The cap
     # is applied locally afterwards by subsample_in_place().
     paths = None
-    try:
-        paths = download_parquet_files(key, force=force)
-    except Exception as e:
-        print(f"  parquet path failed ({e}); falling back to datasets")
+    # An explicit file list means the repo has no usable parquet; go straight
+    # to the pandas path instead of listing the repo and guessing.
+    if repo.get("files"):
+        paths = download_plain_files(key, force=force)
+    else:
+        try:
+            paths = download_parquet_files(key, force=force)
+        except Exception as e:
+            print(f"  parquet path failed ({e}); falling back to datasets")
+        if paths is not None:
+            paths = subsample_in_place(key, paths)
 
     if paths is None:
         paths = download_via_datasets(key, force=force)
-    else:
-        paths = subsample_in_place(key, paths)
 
     rows, columns = describe(paths)
     print(f"  {key}: {rows:,} rows | columns: {columns}")

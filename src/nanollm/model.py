@@ -427,7 +427,8 @@ class Transformer(nn.Module):
         return self.final_norm(x)
 
     def forward(self, idx, start_pos=0, kv_cache=None, attn_mask=None,
-                mode="logits", targets=None, length_normalize=True):
+                mode="logits", targets=None, length_normalize=True,
+                loss_weights=None):
         """Returns (logits, None). The second element is vestigial -- it used to
         carry an MoE aux loss that was always literally 0.0.
 
@@ -439,7 +440,8 @@ class Transformer(nn.Module):
         Every trainer therefore calls ``train_model(xs, targets=ys, mode=...)``.
         """
         if mode == "loss":
-            return self.calculate_loss(idx, targets, attn_mask=attn_mask)
+            return self.calculate_loss(idx, targets, attn_mask=attn_mask,
+                                       weights=loss_weights)
         if mode == "seq_logprobs":
             return self.sequence_logprobs(
                 idx, targets, attn_mask=attn_mask,
@@ -449,24 +451,46 @@ class Transformer(nn.Module):
         x = self.forward_hidden(idx, start_pos, kv_cache, attn_mask)
         return self.logit_proj(x), None
 
-    def _loss_chunk(self, h, targets):
-        """Projection + CE for one slice. Returns (ce_sum, z_sum, n_valid)
-        packed into one tensor so it can be checkpointed."""
+    def _loss_chunk(self, h, targets, weights=None):
+        """Projection + CE for one slice. Returns (ce_sum, z_sum, w_sum)
+        packed into one tensor so it can be checkpointed.
+
+        ``weights`` is an optional per-token multiplier on the CE term, used by
+        SFT to stop long replies from owning the whole gradient (see
+        ``pad_batch``). ``None`` gives every supervised token a weight of 1,
+        which is the plain token mean -- the pretraining path, unchanged.
+        """
         logits = self.logit_proj(h).float()
         flat = logits.reshape(-1, self.vocab_size)
         tgt = targets.reshape(-1)
-        ce = F.cross_entropy(flat, tgt, reduction="sum", ignore_index=IGNORE_INDEX)
+        valid = tgt != IGNORE_INDEX
+        if weights is None:
+            ce = F.cross_entropy(flat, tgt, reduction="sum",
+                                 ignore_index=IGNORE_INDEX)
+            w = valid.to(ce.dtype)
+        else:
+            # reduction="none" already returns 0 at ignore_index positions, so
+            # multiplying by the mask only guards against a caller passing a
+            # non-zero weight there.
+            per = F.cross_entropy(flat, tgt, reduction="none",
+                                  ignore_index=IGNORE_INDEX)
+            w = weights.reshape(-1).to(per.dtype) * valid
+            ce = (per * w).sum()
         if self.z_loss_weight:
-            valid = tgt != IGNORE_INDEX
             z = torch.logsumexp(flat, dim=-1)
-            z_sum = (z[valid] ** 2).sum()
+            z_sum = (w * z ** 2).sum()
         else:
             z_sum = ce.new_zeros(())
-        n = (tgt != IGNORE_INDEX).sum().to(ce.dtype)
-        return torch.stack((ce, z_sum, n))
+        return torch.stack((ce, z_sum, w.sum()))
 
-    def calculate_loss(self, xs, ys, attn_mask=None, **_legacy):
-        """Token-level cross entropy, computed in chunks over the sequence."""
+    def calculate_loss(self, xs, ys, attn_mask=None, weights=None, **_legacy):
+        """Token-level cross entropy, computed in chunks over the sequence.
+
+        ``weights`` (optional, same shape as ``ys``) turns the token mean into
+        a weighted mean. Both the CE and the z-loss are normalised by the same
+        weight sum, so with ``weights=None`` this is identical to the plain
+        mean it has always computed.
+        """
         h = self.forward_hidden(xs, attn_mask=attn_mask)
 
         T = h.size(1)
@@ -475,17 +499,18 @@ class Transformer(nn.Module):
         for i in range(0, T, chunk):
             hs = h[:, i:i + chunk]
             ts = ys[:, i:i + chunk]
+            ws = None if weights is None else weights[:, i:i + chunk]
             if self.training and torch.is_grad_enabled():
                 part = torch.utils.checkpoint.checkpoint(
-                    self._loss_chunk, hs, ts, use_reentrant=False)
+                    self._loss_chunk, hs, ts, ws, use_reentrant=False)
             else:
-                part = self._loss_chunk(hs, ts)
+                part = self._loss_chunk(hs, ts, ws)
             totals = part if totals is None else totals + part
 
-        ce_sum, z_sum, n = totals[0], totals[1], totals[2].clamp(min=1.0)
-        loss = ce_sum / n
+        ce_sum, z_sum, w_sum = totals[0], totals[1], totals[2].clamp(min=1.0)
+        loss = ce_sum / w_sum
         if self.z_loss_weight:
-            loss = loss + self.z_loss_weight * (z_sum / n)
+            loss = loss + self.z_loss_weight * (z_sum / w_sum)
         return loss
 
     def sequence_logprobs(self, xs, ys, attn_mask=None,
